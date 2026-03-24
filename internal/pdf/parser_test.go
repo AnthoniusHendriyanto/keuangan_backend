@@ -100,8 +100,12 @@ func TestGuessCategory(t *testing.T) {
 	}
 }
 
-func TestExtractTransactions(t *testing.T) {
+func TestExtractFromText(t *testing.T) {
 	p := NewParser()
+
+	// Provide a dummy PDF-like structure so extractFormatA won't fail if we bypass the file reader.
+	// Actually, the easiest way to test the logic now without the PDF wrapper 
+	// is to test the internal strategies directly for Format A.
 
 	tests := []struct {
 		name      string
@@ -166,9 +170,9 @@ func TestExtractTransactions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := p.extractTransactions(tt.content)
+			got := p.extractFormatA(tt.content)
 			if len(got) != tt.wantCount {
-				t.Fatalf("extractTransactions() returned %d transactions, want %d", len(got), tt.wantCount)
+				t.Fatalf("extractFormatA() returned %d transactions, want %d", len(got), tt.wantCount)
 			}
 			if tt.wantCount > 0 {
 				first := got[0]
@@ -194,7 +198,7 @@ func TestExtractTransactions_MultipleRowsOrder(t *testing.T) {
 	content := `15/03/2026 GRAB CAR 150.000
 20/03/2026 NETFLIX SUBSCRIPTION 199.000`
 
-	got := p.extractTransactions(content)
+	got := p.extractFormatA(content)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 transactions, got %d", len(got))
 	}

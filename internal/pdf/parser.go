@@ -53,17 +53,37 @@ func NewParser() *Parser {
 
 // ParseStatement processes an Indonesian bank statement PDF.
 func (p *Parser) ParseStatement(rs io.ReadSeeker) ([]model.ExtractedTransaction, error) {
-	content, err := p.extractText(rs)
+	pages, err := p.extractPages(rs)
 	if err != nil {
 		return nil, err
 	}
 
-	transactions := p.extractTransactions(content)
-	if len(transactions) == 0 {
-		return nil, ErrNoTransactions
+	// Try multi-page strategies first (AEON uses one composite content)
+	combined := strings.Join(pages, "\n--- PAGE BREAK ---\n")
+
+	// Strategy 1: Format A (plain text DD/MM/YYYY)
+	if txs := p.extractFormatA(combined); len(txs) > 0 {
+		return txs, nil
 	}
 
-	return transactions, nil
+	// Strategy 2: AEON content stream from combined pages
+	if txs := p.extractFromContentStream(combined); len(txs) > 0 {
+		return txs, nil
+	}
+
+	// Strategy 3: BCA Debit — process EACH PAGE independently to avoid Y-coordinate bleeding
+	var allTxs []model.ExtractedTransaction
+	globalIdx := 0
+	for _, pageContent := range pages {
+		txs := p.extractBCADebitPage(pageContent, globalIdx)
+		allTxs = append(allTxs, txs...)
+		globalIdx += len(txs)
+	}
+	if len(allTxs) > 0 {
+		return allTxs, nil
+	}
+
+	return nil, ErrNoTransactions
 }
 
 // ParseStatementFromBytes is a convenience wrapper for byte slices.
@@ -71,74 +91,274 @@ func (p *Parser) ParseStatementFromBytes(data []byte) ([]model.ExtractedTransact
 	return p.ParseStatement(bytes.NewReader(data))
 }
 
-// extractText pulls raw content from the PDF.
-func (p *Parser) extractText(rs io.ReadSeeker) (string, error) {
+// extractPages pulls raw content from each page of the PDF.
+func (p *Parser) extractPages(rs io.ReadSeeker) ([]string, error) {
 	data, err := io.ReadAll(rs)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidFile, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
 
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
-		return "", fmt.Errorf("%w: file does not start with PDF header", ErrInvalidFile)
+		return nil, fmt.Errorf("%w: file does not start with PDF header", ErrInvalidFile)
 	}
 
 	tmpFile, err := os.CreateTemp("", "statement-*.pdf")
 	if err != nil {
-		return "", fmt.Errorf("%w: could not create temp file", ErrInvalidFile)
+		return nil, fmt.Errorf("%w: could not create temp file", ErrInvalidFile)
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := tmpFile.Write(data); err != nil {
 		tmpFile.Close()
-		return "", fmt.Errorf("%w: could not write temp file", ErrInvalidFile)
+		return nil, fmt.Errorf("%w: could not write temp file", ErrInvalidFile)
 	}
 	tmpFile.Close()
 
 	tmpDir, err := os.MkdirTemp("", "pdf-extract-*")
 	if err != nil {
-		return "", fmt.Errorf("%w: could not create temp dir", ErrInvalidFile)
+		return nil, fmt.Errorf("%w: could not create temp dir", ErrInvalidFile)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	err = api.ExtractContentFile(tmpPath, tmpDir, nil, nil)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidFile, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
 
-	var textBuilder strings.Builder
-	files, _ := filepath.Glob(filepath.Join(tmpDir, "*"))
+	files, err := filepath.Glob(filepath.Join(tmpDir, "*"))
+	if err != nil || len(files) == 0 {
+		return nil, ErrEmptyPDF
+	}
+
+	var pages []string
 	for _, f := range files {
 		content, err := os.ReadFile(f)
 		if err != nil {
 			continue
 		}
-		textBuilder.Write(content)
-		textBuilder.WriteByte('\n')
+		text := strings.TrimSpace(string(content))
+		if text != "" {
+			pages = append(pages, text)
+		}
 	}
 
-	text := strings.TrimSpace(textBuilder.String())
-	if text == "" {
-		return "", ErrEmptyPDF
+	if len(pages) == 0 {
+		return nil, ErrEmptyPDF
 	}
 
-	return text, nil
+	return pages, nil
 }
 
-// extractTransactions tries multiple parsing strategies and returns the best result.
-func (p *Parser) extractTransactions(content string) []model.ExtractedTransaction {
-	// Strategy 1: Try Format A (plain text DD/MM/YYYY)
-	if txs := p.extractFormatA(content); len(txs) > 0 {
-		return txs
+// extractBCADebitPage parses BCA Tabungan/Debit statements page by page.
+// Format: Td sets position, Tj sets text. Each transaction row appears by Y-coordinate.
+// Columns: ~43 = date (DD/MM), ~88 = description, ~194 = detail lines, ~400 = amount, ~441 = DB/CR
+func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.ExtractedTransaction {
+	// Match: X Y Td followed by (text) Tj
+	// Example: "43.25 575.99 Td\n(26/02)Tj"
+	tdTjRegex := regexp.MustCompile(`([\d.]+)\s+([\d.]+)\s+Td\s*\n(?:/\S+\s+Tw\s*\n)?(?:/\S+\s+\S+\s+\S+\s+\S+\s+Tc\s*\n)?(?:\S+\s+Tc\s*\n)?(?:\S+\s+Tw\s*\n)?\(([^)]*)\)\s*Tj`)
+
+	type token struct {
+		x, y float64
+		text string
 	}
 
-	// Strategy 2: Try reconstructing text from PDF Tj operators (AEON-style)
-	if txs := p.extractFromContentStream(content); len(txs) > 0 {
-		return txs
+	var tokens []token
+	matches := tdTjRegex.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		x, _ := strconv.ParseFloat(m[1], 64)
+		y, _ := strconv.ParseFloat(m[2], 64)
+		tokens = append(tokens, token{x: x, y: y, text: strings.TrimSpace(m[3])})
 	}
 
-	return nil
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// BCA short-date regex: exactly DD/MM with no year
+	shortDateRe := regexp.MustCompile(`^\d{2}/\d{2}$`)
+	// Amount regex: numeric with dots/commas
+	amountRe := regexp.MustCompile(`^[\d,]+\.\d{2}$`)
+
+	// Group tokens by Y (rows within ~2pt tolerance)
+	type row struct {
+		y      float64
+		tokens []token
+	}
+
+	var rows []row
+	const yTol = 2.0
+	for _, t := range tokens {
+		found := false
+		for i := range rows {
+			if abs64(rows[i].y-t.y) <= yTol {
+				rows[i].tokens = append(rows[i].tokens, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append(rows, row{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows descending by Y (PDF origin is bottom-left, so higher Y = higher on page)
+	// We want top-to-bottom order → sort descending
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[i].y < rows[j].y {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+
+	// BCA transactions appear in blocks anchored by a date token at ~X=43
+	// Column layout (approx): date=43, type=88, detail=194, amount=~398-415, db/cr=~441, balance=~530
+	type txBlock struct {
+		dateStr  string
+		descParts []string
+		amount   string
+		isDB     bool
+	}
+
+	var blocks []txBlock
+	var current *txBlock
+
+	for _, row := range rows {
+		// Find date column token (X≈43)
+		var dateToken, typeToken, amtToken, dbToken string
+		var detailTokens []string
+
+		for _, t := range row.tokens {
+			switch {
+			case t.x < 70 && shortDateRe.MatchString(t.text):
+				dateToken = t.text
+			case t.x >= 70 && t.x < 180:
+				typeToken = t.text
+			case t.x >= 180 && t.x < 380:
+				if t.text != "" {
+					detailTokens = append(detailTokens, t.text)
+				}
+			case t.x >= 380 && t.x < 460 && amountRe.MatchString(t.text):
+				amtToken = t.text
+			case t.x >= 430 && t.x < 470 && (t.text == "DB" || t.text == "CR"):
+				dbToken = t.text
+			}
+		}
+
+		// New transaction block when we see a date
+		if dateToken != "" {
+			if current != nil {
+				blocks = append(blocks, *current)
+			}
+			current = &txBlock{dateStr: dateToken, isDB: false}
+			if typeToken != "" {
+				current.descParts = append(current.descParts, typeToken)
+			}
+			for _, d := range detailTokens {
+				current.descParts = append(current.descParts, d)
+			}
+			if amtToken != "" {
+				current.amount = amtToken
+			}
+			if dbToken == "DB" {
+				current.isDB = true
+			}
+		} else if current != nil {
+			// Continuation row for current block
+			if typeToken != "" {
+				current.descParts = append(current.descParts, typeToken)
+			}
+			for _, d := range detailTokens {
+				current.descParts = append(current.descParts, d)
+			}
+			if amtToken != "" && current.amount == "" {
+				current.amount = amtToken
+			}
+			if dbToken == "DB" {
+				current.isDB = true
+			}
+		}
+	}
+	if current != nil {
+		blocks = append(blocks, *current)
+	}
+
+	// Parse statement year from header (look for FEBRUARI 2026 / MARET 2026 etc.)
+	year := time.Now().Year()
+	yearRe := regexp.MustCompile(`(?:JANUARI|FEBRUARI|MARET|APRIL|MEI|JUNI|JULI|AGUSTUS|SEPTEMBER|OKTOBER|NOVEMBER|DESEMBER)\s+(\d{4})`)
+	if ym := yearRe.FindStringSubmatch(content); len(ym) > 1 {
+		year, _ = strconv.Atoi(ym[1])
+	}
+
+	// Convert blocks to transactions
+	var transactions []model.ExtractedTransaction
+	idx := 0
+	for _, b := range blocks {
+		// Skip if no amount or not a debit (we only track spending)
+		if b.amount == "" || !b.isDB {
+			continue
+		}
+
+		// Parse date: DD/MM with year from header
+		parts := strings.Split(b.dateStr, "/")
+		if len(parts) != 2 {
+			continue
+		}
+		day, err1 := strconv.Atoi(parts[0])
+		month, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+
+		amount, err := parseIDRAmount(b.amount)
+		if err != nil || amount <= 0 {
+			continue
+		}
+
+		// Build description from parts, filtering noise
+		var descParts []string
+		for _, d := range b.descParts {
+			d = strings.TrimSpace(d)
+			// Skip reference/technical lines (TGL:, QR, addresses)
+			if d == "" || strings.HasPrefix(d, "TGL:") || strings.HasPrefix(d, "QR ") ||
+				strings.HasPrefix(d, "CUST NO.:") || strings.HasPrefix(d, "00000.00") ||
+				d == "DB" || d == "CR" || len(d) < 2 {
+				continue
+			}
+			descParts = append(descParts, d)
+		}
+		desc := strings.Join(descParts, " - ")
+		desc = cleanDescription(desc)
+		if desc == "" {
+			continue
+		}
+
+		transactions = append(transactions, model.ExtractedTransaction{
+			TempID:          fmt.Sprintf("pdf-%d", idx),
+			AmountIDR:       amount,
+			TransactionDate: date,
+			Description:     desc,
+			Category:        guessCategory(desc),
+		})
+		idx++
+	}
+
+	return transactions
 }
+
+func abs64(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+
 
 // extractFormatA handles plain text statements with DD/MM/YYYY format.
 func (p *Parser) extractFormatA(content string) []model.ExtractedTransaction {
