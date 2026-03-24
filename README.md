@@ -65,10 +65,9 @@ Execute the following in your Supabase SQL Editor to set up the tables and RLS:
 CREATE TABLE public.credit_cards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL,
-    bank_name TEXT NOT NULL,
     card_name TEXT NOT NULL,
-    statement_date INTEGER NOT NULL CHECK (statement_date BETWEEN 1 AND 31),
-    due_date INTEGER NOT NULL CHECK (due_date BETWEEN 1 AND 31),
+    cutoff_day INTEGER NOT NULL CHECK (cutoff_day BETWEEN 1 AND 31),
+    due_day INTEGER NOT NULL CHECK (due_day BETWEEN 1 AND 31),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -76,13 +75,14 @@ CREATE TABLE public.credit_cards (
 CREATE TABLE public.transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL,
-    credit_card_id UUID REFERENCES public.credit_cards(id),
     amount_idr BIGINT NOT NULL,
     transaction_date TIMESTAMPTZ NOT NULL,
     description TEXT NOT NULL,
     category TEXT NOT NULL CHECK (category IN ('Food & Beverage', 'Transport', 'Shopping', 'Bills', 'Entertainment', 'Groceries', 'Health', 'Education', 'Investment', 'Others', 'General', 'Utilities', 'Transfer')),
+    type TEXT NOT NULL, -- 'MANUAL' or 'PDF_PARSED'
     status TEXT NOT NULL CHECK (status IN ('PENDING', 'RECONCILED', 'DISPUTED')),
-    is_manual BOOLEAN NOT NULL DEFAULT FALSE,
+    payment_method TEXT NOT NULL, -- 'CREDIT_CARD', 'CASH', 'QR_BANK'
+    credit_card_id UUID REFERENCES public.credit_cards(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
