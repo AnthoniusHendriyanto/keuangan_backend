@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	pdfcpumodel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // Common errors returned by the parser.
@@ -21,6 +22,7 @@ var (
 	ErrEmptyPDF       = errors.New("pdf: extracted text is empty, the file may be image-based or encrypted")
 	ErrInvalidFile    = errors.New("pdf: failed to read or parse the file, ensure it is a valid PDF")
 	ErrNoTransactions = errors.New("pdf: no transaction rows could be extracted from the statement")
+	ErrPasswordRequired = errors.New("pdf: file is encrypted and requires a password to open")
 )
 
 // Regex patterns for different statement formats
@@ -52,8 +54,8 @@ func NewParser() *Parser {
 }
 
 // ParseStatement processes an Indonesian bank statement PDF.
-func (p *Parser) ParseStatement(rs io.ReadSeeker) ([]model.ExtractedTransaction, error) {
-	pages, err := p.extractPages(rs)
+func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.ExtractedTransaction, error) {
+	pages, err := p.extractPages(rs, password)
 	if err != nil {
 		return nil, err
 	}
@@ -87,12 +89,12 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker) ([]model.ExtractedTransaction,
 }
 
 // ParseStatementFromBytes is a convenience wrapper for byte slices.
-func (p *Parser) ParseStatementFromBytes(data []byte) ([]model.ExtractedTransaction, error) {
-	return p.ParseStatement(bytes.NewReader(data))
+func (p *Parser) ParseStatementFromBytes(data []byte, password string) ([]model.ExtractedTransaction, error) {
+	return p.ParseStatement(bytes.NewReader(data), password)
 }
 
 // extractPages pulls raw content from each page of the PDF.
-func (p *Parser) extractPages(rs io.ReadSeeker) ([]string, error) {
+func (p *Parser) extractPages(rs io.ReadSeeker, password string) ([]string, error) {
 	data, err := io.ReadAll(rs)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
@@ -121,8 +123,17 @@ func (p *Parser) extractPages(rs io.ReadSeeker) ([]string, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	err = api.ExtractContentFile(tmpPath, tmpDir, nil, nil)
+	var conf *pdfcpumodel.Configuration
+	if password != "" {
+		conf = pdfcpumodel.NewDefaultConfiguration()
+		conf.UserPW = password
+	}
+
+	err = api.ExtractContentFile(tmpPath, tmpDir, nil, conf)
 	if err != nil {
+		if strings.Contains(err.Error(), "password") {
+			return nil, ErrPasswordRequired
+		}
 		return nil, fmt.Errorf("%w: %v", ErrInvalidFile, err)
 	}
 

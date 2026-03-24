@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -91,11 +93,20 @@ func (h *TransactionHandler) UploadStatement(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open file"})
 	}
 	defer file.Close()
+	// Get the optional password from form data
+	password := c.FormValue("password")
 
 	// 1. Parse PDF
-	extracted, err := h.parser.ParseStatement(file)
+	extracted, err := h.parser.ParseStatement(file, password) // Modified to pass password
 	if err != nil {
-		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{"error": err.Error()})
+		if errors.Is(err, pdf.ErrPasswordRequired) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "This PDF is password-protected. Please provide the password in the request.",
+			})
+		}
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("Failed to parse statement: %v", err),
+		})
 	}
 
 	// 2. Fetch existing PENDING manual transactions for fuzzy matching
