@@ -1,48 +1,54 @@
 package handler
 
 import (
-	"time"
-
 	"keuangan_backend/internal/model"
+	"keuangan_backend/internal/repository"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 )
 
-// In-memory store for now
-var mockCreditCards = []model.CreditCard{
-	{
-		ID:        uuid.MustParse("e429b9f7-0000-0000-0000-000000000000"),
-		CardName:  "BCA Everyday",
-		CutoffDay: 20,
-		DueDay:    5,
-		CreatedAt: time.Now(),
-	},
+type CreditCardHandler struct {
+	repo *repository.CreditCardRepository
+}
+
+func NewCreditCardHandler(repo *repository.CreditCardRepository) *CreditCardHandler {
+	return &CreditCardHandler{repo: repo}
 }
 
 // ListCreditCards handles GET /v1/credit-cards
-func ListCreditCards(c fiber.Ctx) error {
+func (h *CreditCardHandler) ListCreditCards(c fiber.Ctx) error {
+	userID := c.Locals("userID").(uuid.UUID)
+
+	cards, err := h.repo.ListByUserID(c.Context(), userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	return c.JSON(fiber.Map{
-		"data": mockCreditCards,
+		"data": cards,
 	})
 }
 
 // CreateCreditCard handles POST /v1/credit-cards
-func CreateCreditCard(c fiber.Ctx) error {
+func (h *CreditCardHandler) CreateCreditCard(c fiber.Ctx) error {
+	userID := c.Locals("userID").(uuid.UUID)
+
 	var req model.CreateCreditCardRequest
 	if err := c.Bind().JSON(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	newCard := model.CreditCard{
-		ID:        uuid.New(),
+	card := model.CreditCard{
 		CardName:  req.CardName,
 		CutoffDay: req.CutoffDay,
 		DueDay:    req.DueDay,
-		CreatedAt: time.Now(),
 	}
 
-	mockCreditCards = append(mockCreditCards, newCard)
+	newCard, err := h.repo.Create(c.Context(), userID, card)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"data": newCard,

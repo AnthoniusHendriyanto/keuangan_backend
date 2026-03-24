@@ -1,21 +1,65 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"keuangan_backend/internal/router"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/logger"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Initialize structured logger
+	// 1. Initialize structured logger
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
+	// 2. Load .env file
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("No .env file found, using environment variables")
+	}
+
+	// 3. Setup Database Connection Pool
+	dbURL := os.Getenv("SUPABASE_DB_URL")
+	if dbURL == "" {
+		slog.Error("SUPABASE_DB_URL is not set")
+		os.Exit(1)
+	}
+
+	config, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		slog.Error("Failed to parse database URL", "error", err)
+		os.Exit(1)
+	}
+
+	// Tweak pool settings for production-readiness
+	config.MaxConns = 10
+	config.MinConns = 2
+	config.MaxConnLifetime = 30 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		slog.Error("Failed to connect to database", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// Ping check
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(ctx); err != nil {
+		slog.Error("Failed to ping database", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("Successfully connected to Supabase PostgreSQL")
+
+	// 4. Initialize Fiber
 	app := fiber.New(fiber.Config{
 		AppName: "True Liability Tracker API v1",
 	})
@@ -24,9 +68,9 @@ func main() {
 	app.Use(logger.New())
 
 	// Routes
-	router.SetupRoutes(app)
+	router.SetupRoutes(app, pool)
 
-	// Graceful Shutdown Setup
+	// Graceful Shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
@@ -36,8 +80,13 @@ func main() {
 		_ = app.Shutdown()
 	}()
 
-	slog.Info("Server is starting on :8080")
-	if err := app.Listen(":8080"); err != nil {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	slog.Info("Server is starting", "port", port)
+	if err := app.Listen(":" + port); err != nil {
 		slog.Error("Failed to start server", "error", err)
 	}
 
