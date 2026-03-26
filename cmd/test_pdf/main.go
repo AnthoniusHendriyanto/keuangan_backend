@@ -22,7 +22,11 @@ func main() {
 	defer file.Close()
 
 	parser := pdf.NewParser()
-	transactions, err := parser.ParseStatement(file, "")
+	password := ""
+	if len(os.Args) >= 3 {
+		password = os.Args[2]
+	}
+	transactions, err := parser.ParseStatement(file, password)
 	if err != nil {
 		log.Fatalf("Parse error: %v", err)
 	}

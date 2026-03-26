@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"keuangan_backend/internal/model"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +21,9 @@ import (
 
 // Common errors returned by the parser.
 var (
-	ErrEmptyPDF       = errors.New("pdf: extracted text is empty, the file may be image-based or encrypted")
-	ErrInvalidFile    = errors.New("pdf: failed to read or parse the file, ensure it is a valid PDF")
-	ErrNoTransactions = errors.New("pdf: no transaction rows could be extracted from the statement")
+	ErrEmptyPDF         = errors.New("pdf: extracted text is empty, the file may be image-based or encrypted")
+	ErrInvalidFile      = errors.New("pdf: failed to read or parse the file, ensure it is a valid PDF")
+	ErrNoTransactions   = errors.New("pdf: no transaction rows could be extracted from the statement")
 	ErrPasswordRequired = errors.New("pdf: file is encrypted and requires a password to open")
 )
 
@@ -34,8 +36,15 @@ var regexFormatA = regexp.MustCompile(`(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([\d.]+(?:,
 // After text reconstruction, lines look like: "12 Feb 2026 | 12 Feb 2026 | MERCHANT NAME | 160,000"
 var regexFormatB = regexp.MustCompile(`(\d{1,2}\s+\w{3}\s+\d{4})\s+\d{1,2}\s+\w{3}\s+\d{4}\s+(.+?)\s+([\d,]+)\s*$`)
 
+// Format D: DD/MM/YY HH:MM:SS DESC TELLER DEBIT CREDIT BALANCE (BRImo e-Statement)
+// e.g., 16/02/26 17:41:21 Transfer BI-Fast dari Bank Lain - STEPANUS HEN 8888680 0.00 1,571,519.00 7,670,030.00
+var regexFormatD = regexp.MustCompile(`^(\d{2}/\d{2}/\d{2}\s\d{2}:\d{2}:\d{2})\s+(.+?)\s+([\d.,]+)\s+([\d.,]+)\s+[\d.,]+$`)
+
 // Format C: raw Tj/TJ content stream extraction
 var regexTjText = regexp.MustCompile(`\(([^)]*)\)\s*Tj`)
+
+// Format E: DD/MM DD/MM DESCRIPTION AMOUNT [CR] (DBS Credit Card)
+var regexFormatE = regexp.MustCompile(`^(\d{2}/\d{2})\s+\d{2}/\d{2}\s+(.+?)\s+([\d,.]+)(?:\s+(CR))?\s*$`)
 
 // Indonesian month names for parsing
 var monthMap = map[string]time.Month{
@@ -83,6 +92,54 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.Extr
 	}
 	if len(allTxs) > 0 {
 		return allTxs, nil
+	}
+
+	// Strategy 4: BRImo e-Statement — process EACH PAGE independently
+	var brimoTxs []model.ExtractedTransaction
+	globalIdx = 0
+	for _, pageContent := range pages {
+		txs := p.extractBRImoPage(pageContent, globalIdx)
+		brimoTxs = append(brimoTxs, txs...)
+		globalIdx += len(txs)
+	}
+	if len(brimoTxs) > 0 {
+		return brimoTxs, nil
+	}
+
+	// Strategy 5: DBS Credit Card — process EACH PAGE independently
+	var dbsTxs []model.ExtractedTransaction
+	globalIdx = 0
+	for _, pageContent := range pages {
+		txs := p.extractDBSPage(pageContent, globalIdx)
+		dbsTxs = append(dbsTxs, txs...)
+		globalIdx += len(txs)
+	}
+	if len(dbsTxs) > 0 {
+		return dbsTxs, nil
+	}
+
+	// Strategy 6: BRI Tokopedia Credit Card — process EACH PAGE independently
+	var briTokpedTxs []model.ExtractedTransaction
+	globalIdx = 0
+	for _, pageContent := range pages {
+		txs := p.extractBRITokpedPage(pageContent, globalIdx)
+		briTokpedTxs = append(briTokpedTxs, txs...)
+		globalIdx += len(txs)
+	}
+	if len(briTokpedTxs) > 0 {
+		return briTokpedTxs, nil
+	}
+
+	// Strategy 7: Seabank Digital Bank — process EACH PAGE independently
+	var seabankTxs []model.ExtractedTransaction
+	globalIdx = 0
+	for _, pageContent := range pages {
+		txs := p.extractSeabankPage(pageContent, globalIdx)
+		seabankTxs = append(seabankTxs, txs...)
+		globalIdx += len(txs)
+	}
+	if len(seabankTxs) > 0 {
+		return seabankTxs, nil
 	}
 
 	return nil, ErrNoTransactions
@@ -229,10 +286,10 @@ func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.Extra
 	// BCA transactions appear in blocks anchored by a date token at ~X=43
 	// Column layout (approx): date=43, type=88, detail=194, amount=~398-415, db/cr=~441, balance=~530
 	type txBlock struct {
-		dateStr  string
+		dateStr   string
 		descParts []string
-		amount   string
-		isDB     bool
+		amount    string
+		isDB      bool
 	}
 
 	var blocks []txBlock
@@ -369,8 +426,6 @@ func abs64(x float64) float64 {
 	return x
 }
 
-
-
 // extractFormatA handles plain text statements with DD/MM/YYYY format.
 func (p *Parser) extractFormatA(content string) []model.ExtractedTransaction {
 	lines := strings.Split(content, "\n")
@@ -402,6 +457,123 @@ func (p *Parser) extractFormatA(content string) []model.ExtractedTransaction {
 			Category:        guessCategory(matches[2]),
 		})
 		idx++
+	}
+
+	return transactions
+}
+
+// extractBRImoPage parses structural text chunks specifically laid out in BRImo format.
+func (p *Parser) extractBRImoPage(content string, startIdx int) []model.ExtractedTransaction {
+	var transactions []model.ExtractedTransaction
+
+	// Similar to BCA Debit, grab text locations. Format is usually "X Y Td (Text) Tj"
+	tdTjRegex := regexp.MustCompile(`([\d.]+)\s+([\d.]+)\s+Td\s+\(([^)]*)\)\s*Tj`)
+
+	type token struct {
+		x, y float64
+		text string
+	}
+	var tokens []token
+	for _, m := range tdTjRegex.FindAllStringSubmatch(content, -1) {
+		x, _ := strconv.ParseFloat(m[1], 64)
+		y, _ := strconv.ParseFloat(m[2], 64)
+		tokens = append(tokens, token{x: x, y: y, text: strings.TrimSpace(m[3])})
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Group tokens by Y-coordinate
+	type row struct {
+		y      float64
+		tokens []token
+	}
+	var rows []row
+	for _, t := range tokens {
+		found := false
+		for i := range rows {
+			if abs64(rows[i].y-t.y) <= 1.5 {
+				rows[i].tokens = append(rows[i].tokens, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append(rows, row{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows descending
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[i].y < rows[j].y {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+
+	var lastTx *model.ExtractedTransaction
+	idx := startIdx
+
+	for _, rowTokens := range rows {
+		// Sort tokens in row by X-coordinate ascending
+		for i := 0; i < len(rowTokens.tokens); i++ {
+			for j := i + 1; j < len(rowTokens.tokens); j++ {
+				if rowTokens.tokens[i].x > rowTokens.tokens[j].x {
+					rowTokens.tokens[i], rowTokens.tokens[j] = rowTokens.tokens[j], rowTokens.tokens[i]
+				}
+			}
+		}
+
+		// Recompose text
+		var parts []string
+		for _, t := range rowTokens.tokens {
+			if t.text != "" {
+				parts = append(parts, t.text)
+			}
+		}
+		line := strings.Join(parts, " ")
+
+		if matches := regexFormatD.FindStringSubmatch(line); matches != nil {
+			dateStr := matches[1]
+			desc := strings.TrimSpace(matches[2])
+			debitStr := strings.ReplaceAll(matches[3], ",", "")
+			creditStr := strings.ReplaceAll(matches[4], ",", "")
+
+			pt, err := time.Parse("02/01/06 15:04:05", dateStr)
+			if err != nil {
+				continue
+			}
+
+			var amount int64
+			var category string
+
+			debitVal, _ := strconv.ParseFloat(debitStr, 64)
+			creditVal, _ := strconv.ParseFloat(creditStr, 64)
+
+			if debitVal > 0 {
+				amount = int64(debitVal)
+				category = guessCategory(desc)
+			} else if creditVal > 0 {
+				amount = int64(creditVal)
+				category = "Income"
+			} else {
+				continue // Skip neutral transactions
+			}
+
+			transactions = append(transactions, model.ExtractedTransaction{
+				TempID:          fmt.Sprintf("pdf-%d", idx),
+				AmountIDR:       amount,
+				TransactionDate: pt,
+				Description:     desc,
+				Category:        category,
+			})
+			lastTx = &transactions[len(transactions)-1]
+			idx++
+		} else if lastTx != nil && line != "" && !strings.Contains(line, "AAKGZ") && !strings.Contains(line, "Created By BRIMO") && !strings.Contains(line, "Halaman") && !strings.Contains(line, "cetakan komputer") && !strings.Contains(line, "tanda tangan") && !strings.Contains(line, "alamat email") && !strings.Contains(line, "StatementBRImo") && !strings.Contains(line, "Unit Kerja BANK BRI") && !strings.Contains(line, "Biaya materai") && !strings.Contains(line, "terdapat perbedaan") && !strings.Contains(line, "selambat-lambatnya") && !strings.Contains(line, "RUPIAH") && !strings.Contains(line, "Saldo Awal") && !strings.Contains(line, "Total Transaksi") && !strings.Contains(line, "Terbilang") && !strings.Contains(line, "2026084") {
+			lastTx.Description += " " + strings.TrimSpace(line)
+		}
 	}
 
 	return transactions
@@ -599,4 +771,406 @@ var categoryRules = []categoryRule{
 	{"Entertainment", []string{"netflix", "spotify", "disney", "youtube", "bioskop", "cinema", "lounge", "lotte"}},
 	{"Utilities", []string{"pln", "pdam", "telkom", "indosat", "xl", "tri"}},
 	{"Health", []string{"apotek", "pharmacy", "hospital", "rumah sakit", "klinik"}},
+}
+
+// extractDBSPage parses DBS Credit Card statements using Tm+TJ positional text grouping.
+// DBS content streams use: 1 0 0 -1 X Y Tm ... [(text)] TJ
+func (p *Parser) extractDBSPage(content string, startIdx int) []model.ExtractedTransaction {
+	var transactions []model.ExtractedTransaction
+
+	// Extract tokens: "1 0 0 -1 X Y Tm" followed by "[(text)] TJ"
+	// The Tm sets position, then TJ renders text
+	// Use a permissive capture for text content to handle escaped parens like \(005/006\)
+	tmTjRegex := regexp.MustCompile(`1 0 0 -1 ([\d.]+) ([\d.]+) Tm\s+\d+ Tr\s+/\S+ \d+ Tf\s+\[\(((?:[^)\\]|\\.)*)\)\] TJ`)
+	type token struct {
+		x, y float64
+		text string
+	}
+	var tokens []token
+	for _, m := range tmTjRegex.FindAllStringSubmatch(content, -1) {
+		x, _ := strconv.ParseFloat(m[1], 64)
+		y, _ := strconv.ParseFloat(m[2], 64)
+		text := strings.TrimSpace(m[3])
+		// Clean up PDF string escape sequences like \( and \)
+		text = strings.ReplaceAll(text, "\\(", "(")
+		text = strings.ReplaceAll(text, "\\)", ")")
+
+		if text != "" {
+			tokens = append(tokens, token{x: x, y: y, text: text})
+		}
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Group tokens by Y-coordinate
+	type row struct {
+		y      float64
+		tokens []token
+	}
+	var rows []row
+	for _, t := range tokens {
+		found := false
+		for i := range rows {
+			if abs64(rows[i].y-t.y) <= 1.5 {
+				rows[i].tokens = append(rows[i].tokens, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append(rows, row{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows by Y ascending (top to bottom in PDF coordinate space with -1 flip)
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[i].y > rows[j].y {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+
+	// Detect statement year from header (look for MM/DD/YYYY patterns like 03/02/2026)
+	year := time.Now().Year()
+	dateWithYearRe := regexp.MustCompile(`\d{2}/\d{2}/(\d{4})`)
+	if ym := dateWithYearRe.FindStringSubmatch(content); len(ym) > 1 {
+		year, _ = strconv.Atoi(ym[1])
+	}
+
+	// DBS date regex: just DD/MM at the start of a token
+	dateRe := regexp.MustCompile(`^\d{2}/\d{2}$`)
+
+	idx := startIdx
+
+	for _, r := range rows {
+		// Sort tokens in row by X-coordinate
+		for i := 0; i < len(r.tokens); i++ {
+			for j := i + 1; j < len(r.tokens); j++ {
+				if r.tokens[i].x > r.tokens[j].x {
+					r.tokens[i], r.tokens[j] = r.tokens[j], r.tokens[i]
+				}
+			}
+		}
+
+		// Identify the columns by X-position:
+		// ~67 = Transaction Date (DD/MM)
+		// ~169 = Posting Date (DD/MM)
+		// ~242 = Description
+		// ~479 = "Rp. "
+		// ~518-531 = Amount (possibly with CR suffix)
+		var txDate, desc, amountStr string
+		isCredit := false
+
+		for _, t := range r.tokens {
+			if dateRe.MatchString(t.text) && t.x < 120 {
+				txDate = t.text
+			} else if t.x >= 200 && t.x < 470 && t.text != "Rp. " {
+				desc = t.text
+			} else if t.x >= 470 && t.text != "Rp. " && t.text != "Rp." {
+				raw := strings.TrimSpace(t.text)
+				if strings.HasSuffix(raw, "CR") {
+					isCredit = true
+					raw = strings.TrimSuffix(raw, "CR")
+				}
+				raw = strings.TrimSpace(raw)
+				if raw != "" {
+					amountStr = raw
+				}
+			}
+		}
+
+		// Skip if no transaction date found
+		if txDate == "" || desc == "" || amountStr == "" {
+			continue
+		}
+
+		// Skip header rows
+		if strings.Contains(desc, "PREVIOUS BALANCE") || strings.Contains(desc, "4587-") {
+			continue
+		}
+
+		// Skip credits (payments to card)
+		if isCredit {
+			continue
+		}
+
+		// Parse date
+		dparts := strings.Split(txDate, "/")
+		if len(dparts) != 2 {
+			continue
+		}
+		month, _ := strconv.Atoi(dparts[0])
+		day, _ := strconv.Atoi(dparts[1])
+		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+
+		amount, err := parseIDRAmount(amountStr)
+		if err != nil || amount <= 0 {
+			continue
+		}
+
+		transactions = append(transactions, model.ExtractedTransaction{
+			TempID:          fmt.Sprintf("pdf-%d", idx),
+			AmountIDR:       amount,
+			TransactionDate: date,
+			Description:     desc,
+			Category:        guessCategory(desc),
+		})
+		idx++
+	}
+
+	return transactions
+}
+
+// extractBRITokpedPage processes a single page from a BRI Tokopedia Credit Card PDF.
+func (p *Parser) extractBRITokpedPage(pageContent string, startIdx int) []model.ExtractedTransaction {
+	var transactions []model.ExtractedTransaction
+	idx := startIdx
+
+	// BT X Y Td (Text) Tj
+	re := regexp.MustCompile(`BT\s+([-0-9.]+)\s+([-0-9.]+)\s+Td\s+\((.*?)\)\s+Tj`)
+	matches := re.FindAllStringSubmatch(pageContent, -1)
+
+	type textItem struct {
+		x    float64
+		text string
+	}
+	yGroup := make(map[string][]textItem)
+
+	for _, m := range matches {
+		x, _ := strconv.ParseFloat(m[1], 64)
+		y, _ := strconv.ParseFloat(m[2], 64)
+		text := strings.TrimSpace(m[3])
+		text = strings.ReplaceAll(text, "\\(", "(")
+		text = strings.ReplaceAll(text, "\\)", ")")
+
+		if text == "" {
+			continue
+		}
+
+		yKey := fmt.Sprintf("%.1f", y)
+		yGroup[yKey] = append(yGroup[yKey], textItem{x: x, text: text})
+	}
+
+	var yKeys []string
+	for k := range yGroup {
+		yKeys = append(yKeys, k)
+	}
+	sort.Slice(yKeys, func(i, j int) bool {
+		yi, _ := strconv.ParseFloat(yKeys[i], 64)
+		yj, _ := strconv.ParseFloat(yKeys[j], 64)
+		return yi > yj
+	})
+
+	for _, yKey := range yKeys {
+		items := yGroup[yKey]
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].x < items[j].x
+		})
+
+		var txDate, desc, amountStr string
+		isCredit := false
+
+		for _, item := range items {
+			x := item.x
+			text := item.text
+
+			if x < 100 && len(text) >= 10 && strings.Count(text, "-") == 2 {
+				txDate = text[:10]
+			} else if x > 140 && x < 300 {
+				desc = strings.TrimSpace(desc + " " + text)
+			} else if x > 400 {
+				if text == "CR" {
+					isCredit = true
+				} else if text != "0.00" && !strings.Contains(text, "IDR") {
+					amountStr = text
+				}
+			}
+		}
+
+		// Require a valid transaction date to avoid extracting headers
+		date, err := time.Parse("02-01-2006", txDate)
+		if txDate == "" || err != nil || date.IsZero() {
+			continue
+		}
+
+		if isCredit {
+			continue
+		}
+
+		amount, err := parseIDRAmount(amountStr)
+		if err != nil || amount <= 0 {
+			continue
+		}
+
+		transactions = append(transactions, model.ExtractedTransaction{
+			TempID:          fmt.Sprintf("pdf-%d", idx),
+			AmountIDR:       amount,
+			TransactionDate: date,
+			Description:     desc,
+			Category:        guessCategory(desc),
+		})
+		idx++
+	}
+
+	return transactions
+}
+
+// extractSeabankPage parses Seabank PDF statements which use a UTF-16 style
+// +28 ASCII Caesar shift obfuscation for their text fields.
+func (p *Parser) extractSeabankPage(pageContent string, startIdx int) []model.ExtractedTransaction {
+	var transactions []model.ExtractedTransaction
+	idx := startIdx
+	type token struct { x, y float64; text string }
+	var tokens []token
+
+	lines := strings.Split(pageContent, "\n")
+	var currX, currY float64
+	for _, rawLine := range lines {
+		if strings.HasSuffix(strings.TrimSpace(rawLine), "Tm") {
+			parts := strings.Fields(rawLine)
+			if len(parts) >= 6 {
+				currX, _ = strconv.ParseFloat(parts[4], 64)
+				currY, _ = strconv.ParseFloat(parts[5], 64)
+			}
+		} else if idX := strings.Index(rawLine, "("); idX >= 0 {
+			endIdx := strings.Index(rawLine[idX:], ")")
+				rawStr := rawLine[idX+1 : idX+endIdx]
+				var out strings.Builder
+				for i := 0; i < len(rawStr); i++ {
+					var rawByte byte
+					if rawStr[i] == '\\' && i+1 < len(rawStr) {
+						if rawStr[i+1] >= '0' && rawStr[i+1] <= '7' && i+3 < len(rawStr) {
+							// Octal sequence \ddd
+							octalStr := rawStr[i+1 : i+4]
+							val, err := strconv.ParseInt(octalStr, 8, 32)
+							if err == nil {
+								rawByte = byte(val)
+								i += 3
+							} else {
+								rawByte = rawStr[i] // fallback
+							}
+						} else {
+							// Standard escapes like \( \) \\
+							i++
+							rawByte = rawStr[i]
+						}
+					} else {
+						rawByte = rawStr[i]
+					}
+					
+					if rawByte == 0 {
+						continue
+					}
+					out.WriteByte(rawByte + 28)
+				}
+				if text := strings.TrimSpace(out.String()); text != "" {
+					tokens = append(tokens, token{x: currX, y: currY, text: text})
+				}
+		}
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Group tokens by fuzzy Y coordinate (15pt tolerance) to handle multi-line descriptions
+	type rowGroup struct {
+		y      float64
+		tokens []token
+	}
+	var rows []rowGroup
+
+	for _, t := range tokens {
+		matchedRow := false
+		for i := range rows {
+			if math.Abs(rows[i].y-t.y) < 15.0 {
+				rows[i].tokens = append(rows[i].tokens, t)
+				matchedRow = true
+				break
+			}
+		}
+		if !matchedRow {
+			rows = append(rows, rowGroup{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows top-to-bottom (Y descending)
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].y > rows[j].y
+	})
+
+	for _, r := range rows {
+		rowTokens := r.tokens
+		sort.Slice(rowTokens, func(i, j int) bool {
+			return rowTokens[i].x < rowTokens[j].x
+		})
+		
+		var txDate, desc, amountStr string
+		isCredit := false
+
+		for _, t := range rowTokens {
+			if t.x > 40 && t.x < 100 { 
+				txDate = t.text
+			} else if t.x > 110 && t.x < 260 {
+				if desc != "" {
+					desc += " "
+				}
+				desc += t.text
+			} else if t.x > 260 && t.x < 350 { // Column 3: Outgoing (Debit)
+				if amountStr == "" && t.text != "" && t.text != "0" {
+					amountStr = t.text
+					isCredit = false
+				}
+			} else if t.x > 350 && t.x < 460 { // Column 4: Incoming (Credit)
+				if amountStr == "" && t.text != "" && t.text != "0" {
+					amountStr = t.text
+					isCredit = true
+				}
+			}
+		}
+
+		desc = strings.TrimSpace(desc)
+		amountStr = strings.ReplaceAll(amountStr, ".", "")
+
+		if txDate != "" && amountStr != "" {
+			if matched, _ := regexp.MatchString(`^\d{2}\s+[A-Za-z]+$`, txDate); matched {
+				
+				// Fix truncated "Fx" (Feb) or others due to Seabank's ) parenthesis token truncation
+				cleanDate := txDate
+				if strings.HasSuffix(cleanDate, "x") {
+					if strings.HasPrefix(cleanDate, "0") || strings.HasPrefix(cleanDate, "1") || strings.HasPrefix(cleanDate, "2") || strings.HasPrefix(cleanDate, "3") {
+						// e.g. "08 Fx" -> "08 Feb"
+						cleanDate = cleanDate[:len(cleanDate)-1] + "eb"
+					}
+				}
+
+				txDateWithYear := cleanDate + " 2026"
+
+				date, parseErr := time.Parse("02 Jan 2006", txDateWithYear)
+				if parseErr != nil {
+					continue
+				}
+
+				if isCredit {
+					continue 
+				}
+
+				amt, err := parseIDRAmount(amountStr)
+				if err == nil && amt > 0 {
+					idx++
+					transactions = append(transactions, model.ExtractedTransaction{
+						TempID:          fmt.Sprintf("pdf-%d", idx),
+						TransactionDate: date,
+						Description:     desc,
+						AmountIDR:       amt,
+						Category:        guessCategory(desc),
+					})
+				}
+			}
+		}
+	}
+	return transactions
 }

@@ -4,9 +4,9 @@ A production-ready Golang backend powering the **True Liability Tracker** mobile
 
 ## Key Features
 
-- **Multi-Strategy PDF Parsing**: Automatically extracts and normalises data from complex Indonesian bank statements (e.g., BCA plain-text and AEON content-stream Tj operators) with password decryption support.
+- **Multi-Strategy PDF Parsing**: Automatically extracts and normalises data from complex Indonesian bank statements (BCA Credit/Debit, AEON, BRImo, and DBS) with multi-page handling and password decryption.
 - **AI Merge Wizard**: A smart reconciliation engine using fuzzy matching (Levenshtein distance) and temporal proximity to suggest merge candidates between user-entered manual transactions and imported PDF statement rows.
-- **Supabase Integration**: Native `pgxpool` connection to Supabase PostgreSQL, leveraging Row-Level Security (RLS) for multi-tenant data isolation.
+- **Supabase Integration**: Native `pgxpool` connection to Supabase PostgreSQL, leveraging Row-Level Security (RLS) and Supavisor Pooler (Port 6543) for isolated multi-tenant data management.
 - **Data Integrity**: Enforces strict `int64` standardisation for all IDR amounts to eliminate floating-point precision errors.
 - **Clean Architecture**: Decoupled, testable layers (Handler → Repository) built on a high-speed Fiber v3 routing foundation.
 
@@ -18,7 +18,7 @@ A production-ready Golang backend powering the **True Liability Tracker** mobile
 - **Framework**: Fiber v3
 - **Database**: PostgreSQL (via Supabase) with `pgx/v5`
 - **Authentication**: JWT token validation parsing (`golang-jwt/v5`)
-- **PDF Extraction**: PDFCPU (`github.com/pdfcpu/pdfcpu`)
+- **PDF Extraction**: PDFCPU (`github.com/pdfcpu/pdfcpu@v0.9.1`) & `dslipak/pdf`
 - **Fuzzy Logic**: Golang Levenshtein algorithm
 
 ---
@@ -144,7 +144,9 @@ Because Indonesian banks use wildly different formats (Standard text vs custom C
 
 - **Strategy 1 (Format A)**: Fallback standard DD/MM/YYYY plaintext regex capturing.
 - **Strategy 2 (Format B - AEON)**: Global layout content stream Tj token reconstruction.
-- **Strategy 3 (Format C - BCA)**: Highly-accurate `Td` positioning logic assembling rows by absolute Y-coordinates to dodge arbitrary PDF column formatting.
+- **Strategy 3 (BCA Debit)**: Positional `Td` logic assembling rows by absolute Y-coordinates.
+- **Strategy 4 (BRImo)**: Page-isolated positional extraction with multi-line description support.
+- **Strategy 5 (DBS Credit)**: Positional reconstruction with `CR` (Credit) detection and strict Indonesian `DD/MM` date parsing.
 
 ### Advanced Component: The AI Merge Wizard
 
@@ -169,17 +171,88 @@ When processing the `POST /v1/transactions/upload-statement` endpoint, the syste
 
 ---
 
-## API Endpoints
+## API Guide & CURL Examples
 
-All authenticated routes are grouped under `/v1/`.
+All endpoints are prefixed with `/v1`. Authenticated routes require a Supabase JWT in the `Authorization: Bearer <TOKEN>` header.
 
-- **Health**
-  - `GET /health` : Public liveness probe.
-- **Credit Cards**
-  - `GET /v1/credit-cards` : List all added cards.
-  - `POST /v1/credit-cards` : Create a new card.
-- **Transactions**
-  - `GET /v1/transactions/card/:card_id` : Fetch transactions for a specific card.
-  - `POST /v1/transactions/record` : Insert a user's manual (cash) transaction.
-  - `POST /v1/transactions/merge` : Confirm a Merge Wizard suggestion (Updates DB row to `RECONCILED`).
-  - `POST /v1/transactions/upload-statement` : Upload a `multipart/form-data` PDF (`file` param + optional `password` param) and execute the AI Engine to receive suggested merges.
+### 1. Health & Connectivity
+Check the liveness of the API and its connection to the Supabase database.
+```bash
+curl http://localhost:8080/v1/health
+```
+
+### 2. Credit Cards
+**List Cards:**
+```bash
+curl -H "Authorization: Bearer <JWT>" http://localhost:8080/v1/credit-cards/
+```
+
+**Create Card:**
+```bash
+curl -X POST -H "Authorization: Bearer <JWT>" \
+     -H "Content-Type: application/json" \
+     -d '{"card_name": "BCA Everyday Card", "cutoff_day": 5, "due_day": 25}' \
+     http://localhost:8080/v1/credit-cards/
+```
+
+### 3. Transactions
+**List Transactions:**
+```bash
+curl -H "Authorization: Bearer <JWT>" "http://localhost:8080/v1/transactions/?start_date=2024-03-01T00:00:00Z"
+```
+
+**Record Manual Transaction:**
+```bash
+curl -X POST -H "Authorization: Bearer <JWT>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "amount_idr": 45000,
+       "transaction_date": "2024-03-24T12:00:00Z",
+       "description": "Starbucks Coffee",
+       "category": "Food & Beverage",
+       "payment_method": "CASH"
+     }' \
+     http://localhost:8080/v1/transactions/
+```
+
+**Upload Statement (PDF):**
+Uploads a statement and receives a JSON payload of extracted transactions + AI-suggested merges.
+```bash
+curl -X POST -H "Authorization: Bearer <JWT>" \
+     -F "file=@/path/to/statement.pdf" \
+     -F "password=optional_pw" \
+     http://localhost:8080/v1/transactions/upload-statement
+```
+
+**Confirm Merge:**
+Merges an extracted PDF transaction into an existing manual record to change status to `RECONCILED`.
+```bash
+curl -X POST -H "Authorization: Bearer <JWT>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "existing_manual_transaction_id": "[EXISTING_UUID]",
+       "pdf_override_data": {
+         "temp_id": "pdf-0",
+         "amount_idr": 45000,
+         "transaction_date": "2024-03-24T12:05:00Z",
+         "description": "SBX PIK AVENUE"
+       }
+     }' \
+     http://localhost:8080/v1/transactions/merge
+```
+
+---
+
+## Project Status
+
+### ✅ Achieved
+- **Hardened PDF Engine**: Successfully parsing complex layouts for BCA, BRI, AEON, and DBS.
+- **Positional Intelligence**: Overcame "coordinate bleeding" by page-isolated positional grouping.
+- **Database Reconciliation**: AI Merge Wizard prototype identifies matches within a 3-day temporal window and exact amount matching.
+- **Environment Stability**: Migrated to Supavisor Pooler to resolve DNS/connectivity issues in local development.
+
+### 🚧 Still on Development
+- **Mobile Frontend**: The Flutter application is currently being developed with a premium "Obsidian" design theme.
+- **Native AESV2 Decryption**: Some DBS statements require a "Print to PDF" workaround due to library-level encryption limitations.
+- **Advanced Categories**: Implementing machine learning classifiers for better merchant-to-category mapping.
+- **Batch Processing**: Background workers for large batch statement uploads.
