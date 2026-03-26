@@ -256,7 +256,7 @@ curl -X POST -H "Authorization: Bearer <JWT>" \
 - **Environment Stability**: Migrated to Supavisor Pooler to resolve DNS/connectivity issues in local development.
 
 ### 🚧 Still on Development
-- **Mobile Frontend**: The Flutter application is currently being developed with a premium "Obsidian" design theme.
-- **Native AESV2 Decryption**: Some DBS statements require a "Print to PDF" workaround due to library-level encryption limitations.
+- **Mobile Frontend**: The Flutter application is currently being developed with a premium "Obsidian Sanctuary" design theme.
+- **CSV Support**: Implementing `/v1/statements/upload-csv` for institutions like Superbank that use vector-outlined PDFs.
 - **Advanced Categories**: Implementing machine learning classifiers for better merchant-to-category mapping.
 - **Batch Processing**: Background workers for large batch statement uploads.
