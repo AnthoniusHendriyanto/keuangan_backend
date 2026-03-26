@@ -15,7 +15,8 @@ These banks have been tested and confirmed to work with the `/v1/statements/uplo
 | 3 | **BRI Ovo U Card** | Credit Card | AES-128 (password required) | Uses `BT X Y Td` column layout; CR payments filtered out |
 | 4 | **BRI Tokopedia Card** | Credit Card | AES-128 (password required) | Same layout as BRI Ovo U Card — shared BRI issuing system |
 | 5 | **AEON** | Credit Card | AES-128 (password required) | Uses `DD Mon YYYY` date format |
-| 6 | **DBS** | Credit Card | AES-128 (password required) | Uses `Tm`/`TJ` matrix layout; requires pdfcpu patch for 128-bit key |
+| 6 | **DBS** | Credit Card | AES-128 (password required) | Uses `Tm`/`TJ` matrix layout; parsed natively via `pdfcpu` patch |
+| 7 | **Seabank** | Digital Bank / Debit | Custom +28 Caesar Cipher | Uses heavy obfuscation (Octal escapes + Caesar Shift) |
 
 > **Password-protected PDFs:** For encrypted statements (BRI co-branded, DBS), pass the `password` field in the form-data upload request alongside the PDF file.
 

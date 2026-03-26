@@ -4,7 +4,7 @@ A production-ready Golang backend powering the **True Liability Tracker** mobile
 
 ## Key Features
 
-- **Multi-Strategy PDF Parsing**: Automatically extracts and normalises data from complex Indonesian bank statements (BCA Credit/Debit, AEON, BRImo, and DBS) with multi-page handling and password decryption.
+- **Multi-Strategy PDF Parsing**: Automatically extracts and normalises data from complex Indonesian bank statements (BCA Credit/Debit, AEON, BRImo, DBS, and Seabank) with multi-page handling and specialized decryption (AESV2 + Caesar Cipher).
 - **AI Merge Wizard**: A smart reconciliation engine using fuzzy matching (Levenshtein distance) and temporal proximity to suggest merge candidates between user-entered manual transactions and imported PDF statement rows.
 - **Supabase Integration**: Native `pgxpool` connection to Supabase PostgreSQL, leveraging Row-Level Security (RLS) and Supavisor Pooler (Port 6543) for isolated multi-tenant data management.
 - **Data Integrity**: Enforces strict `int64` standardisation for all IDR amounts to eliminate floating-point precision errors.
@@ -147,6 +147,8 @@ Because Indonesian banks use wildly different formats (Standard text vs custom C
 - **Strategy 3 (BCA Debit)**: Positional `Td` logic assembling rows by absolute Y-coordinates.
 - **Strategy 4 (BRImo)**: Page-isolated positional extraction with multi-line description support.
 - **Strategy 5 (DBS Credit)**: Positional reconstruction with `CR` (Credit) detection and strict Indonesian `DD/MM` date parsing.
+- **Strategy 6 (BRI Tokopedia/Ovo)**: Positional extraction using `BT/Td` coordinate mapping.
+- **Strategy 7 (Seabank Digital)**: Advanced reverse-engineering of +28 Caesar cipher and PDF octal escape obfuscations with 15pt fuzzy spatial grouping.
 
 ### Advanced Component: The AI Merge Wizard
 
@@ -246,7 +248,9 @@ curl -X POST -H "Authorization: Bearer <JWT>" \
 ## Project Status
 
 ### ✅ Achieved
-- **Hardened PDF Engine**: Successfully parsing complex layouts for BCA, BRI, AEON, and DBS.
+- **Hardened PDF Engine**: Successfully parsing complex layouts for BCA, BRI, AEON, DBS, and Seabank.
+- **Native AESV2 Decryption**: Integrated a patched local fork of `pdfcpu` to natively handle encrypted DBS and BRI statements without intermediate workarounds.
+- **Seabank De-obfuscation**: Defeated Seabank's proprietary +28 Caesar shift font encoding.
 - **Positional Intelligence**: Overcame "coordinate bleeding" by page-isolated positional grouping.
 - **Database Reconciliation**: AI Merge Wizard prototype identifies matches within a 3-day temporal window and exact amount matching.
 - **Environment Stability**: Migrated to Supavisor Pooler to resolve DNS/connectivity issues in local development.
