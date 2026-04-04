@@ -19,9 +19,9 @@ go.work
 go.work.sum
 
 # Env files
-.env
-.env.*
-!.env.example
+# .env
+# .env.*
+# !.env.example
 
 # IDEs
 .idea/
