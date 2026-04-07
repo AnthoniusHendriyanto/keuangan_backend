@@ -44,7 +44,7 @@ func (r *TransactionRepository) ListByUserID(ctx context.Context, userID uuid.UU
 	}
 	defer rows.Close()
 
-	var transactions []model.Transaction
+	transactions := make([]model.Transaction, 0)
 	for rows.Next() {
 		var t model.Transaction
 		var cardName *string

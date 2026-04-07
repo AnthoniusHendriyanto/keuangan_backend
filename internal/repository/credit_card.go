@@ -24,7 +24,7 @@ func (r *CreditCardRepository) ListByUserID(ctx context.Context, userID uuid.UUI
 	}
 	defer rows.Close()
 
-	var cards []model.CreditCard
+	cards := make([]model.CreditCard, 0)
 	for rows.Next() {
 		var c model.CreditCard
 		if err := rows.Scan(&c.ID, &c.UserID, &c.CardName, &c.CutoffDay, &c.DueDay, &c.CreatedAt); err != nil {

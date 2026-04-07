@@ -4,11 +4,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -20,14 +23,32 @@ var (
 	es256Pub     *ecdsa.PublicKey
 )
 
-// getES256PublicKey returns the Supabase ES256 public key.
-// We use the components from the JWKS: x, y, and crv (P-256).
+// getES256PublicKey returns the Supabase ES256 public key by fetching it directly.
 func getES256PublicKey() *ecdsa.PublicKey {
 	es256KeyOnce.Do(func() {
-		// These coordinates are from the project's JWKS:
-		// kid: 76c775ef-ab63-4ba3-8941-0399ff16dec0
-		xStr := "pxE7pW4-QpEicC3N32i5yS4fC3zW_lT6v6tY2p_mB48"
-		yStr := "SJvGW0LAa4s7n5gu0j8PQ6undYO5ziBwa7RCqhj2Pw"
+		client := &http.Client{Timeout: 10 * time.Second}
+		url := os.Getenv("SUPABASE_URL") + "/auth/v1/.well-known/jwks.json"
+		
+		resp, err := client.Get(url)
+		if err != nil {
+			slog.Error("Failed to fetch JWKS", "error", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		var data struct {
+			Keys []struct {
+				X string `json:"x"`
+				Y string `json:"y"`
+			} `json:"keys"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil || len(data.Keys) == 0 {
+			slog.Error("Failed to decode JWKS", "error", err)
+			return
+		}
+
+		xStr := data.Keys[0].X
+		yStr := data.Keys[0].Y
 
 		xB, _ := base64.RawURLEncoding.DecodeString(xStr)
 		yB, _ := base64.RawURLEncoding.DecodeString(yStr)
@@ -37,6 +58,7 @@ func getES256PublicKey() *ecdsa.PublicKey {
 			X:     new(big.Int).SetBytes(xB),
 			Y:     new(big.Int).SetBytes(yB),
 		}
+		slog.Info("Successfully fetched and cached ES256 Public Key from Supabase JWKS")
 	})
 	return es256Pub
 }
@@ -68,6 +90,12 @@ func AuthMiddleware(c fiber.Ctx) error {
 		// 2. Handle HS256 (Legacy secrets or service roles)
 		if alg == "HS256" {
 			secret := os.Getenv("SUPABASE_JWT_SECRET")
+			
+			// Handle potentially base64 encoded secrets from Supabase
+			if decoded, err := base64.StdEncoding.DecodeString(secret); err == nil {
+				return decoded, nil
+			}
+			
 			return []byte(secret), nil
 		}
 
