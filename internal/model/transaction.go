@@ -36,6 +36,7 @@ type Transaction struct {
 	PaymentMethod string             `json:"payment_method"`
 	CreditCardID  *uuid.UUID         `json:"credit_card_id,omitempty"`
 	CreditCard    *CreditCardSummary `json:"credit_card,omitempty"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 // CreateTransactionRequest represents a manual input payload.

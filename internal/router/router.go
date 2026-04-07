@@ -22,11 +22,17 @@ func SetupRoutes(app *fiber.App, pool *pgxpool.Pool) {
 	// Handlers
 	ccHandler := handler.NewCreditCardHandler(ccRepo)
 	txHandler := handler.NewTransactionHandler(txRepo, pdfParser)
+	authHandler := handler.NewAuthHandler()
 
 	v1 := app.Group("/v1")
 
 	// Public routes
 	v1.Get("/health", handler.HealthCheck(pool))
+
+	// Auth routes (public — no JWT required)
+	auth := v1.Group("/auth")
+	auth.Post("/login", authHandler.Login)
+	auth.Post("/register", authHandler.Register)
 
 	// Authenticated routes
 	v1.Use(middleware.AuthMiddleware)

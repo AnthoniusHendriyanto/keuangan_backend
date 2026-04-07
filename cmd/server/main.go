@@ -22,7 +22,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	// 2. Load .env file
-	if err := godotenv.Load(); err != nil {
+	if err := godotenv.Overload(); err != nil {
 		slog.Warn("No .env file found, using environment variables")
 	}
 

@@ -19,7 +19,7 @@ func NewTransactionRepository(pool *pgxpool.Pool) *TransactionRepository {
 
 func (r *TransactionRepository) ListByUserID(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time) ([]model.Transaction, error) {
 	query := `SELECT t.id, t.user_id, t.amount_idr, t.transaction_date, t.description, t.category, t.type, t.status, t.payment_method, t.credit_card_id,
-	          c.card_name
+	          t.created_at, c.card_name
 	          FROM public.transactions t
 	          LEFT JOIN public.credit_cards c ON t.credit_card_id = c.id
 	          WHERE t.user_id = $1`
@@ -48,7 +48,7 @@ func (r *TransactionRepository) ListByUserID(ctx context.Context, userID uuid.UU
 	for rows.Next() {
 		var t model.Transaction
 		var cardName *string
-		if err := rows.Scan(&t.ID, &t.UserID, &t.AmountIDR, &t.TransactionDate, &t.Description, &t.Category, &t.Type, &t.Status, &t.PaymentMethod, &t.CreditCardID, &cardName); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.AmountIDR, &t.TransactionDate, &t.Description, &t.Category, &t.Type, &t.Status, &t.PaymentMethod, &t.CreditCardID, &t.CreatedAt, &cardName); err != nil {
 			return nil, err
 		}
 		if t.CreditCardID != nil && cardName != nil {
@@ -61,8 +61,8 @@ func (r *TransactionRepository) ListByUserID(ctx context.Context, userID uuid.UU
 
 func (r *TransactionRepository) Create(ctx context.Context, userID uuid.UUID, tx model.Transaction) (model.Transaction, error) {
 	query := `INSERT INTO public.transactions (user_id, amount_idr, transaction_date, description, category, type, status, payment_method, credit_card_id) 
-	          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`
-	err := r.pool.QueryRow(ctx, query, userID, tx.AmountIDR, tx.TransactionDate, tx.Description, tx.Category, tx.Type, tx.Status, tx.PaymentMethod, tx.CreditCardID).Scan(&tx.ID)
+	          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, created_at`
+	err := r.pool.QueryRow(ctx, query, userID, tx.AmountIDR, tx.TransactionDate, tx.Description, tx.Category, tx.Type, tx.Status, tx.PaymentMethod, tx.CreditCardID).Scan(&tx.ID, &tx.CreatedAt)
 	if err != nil {
 		return model.Transaction{}, err
 	}
