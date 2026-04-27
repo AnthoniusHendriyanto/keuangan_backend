@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -85,7 +86,10 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.Extr
 	// Strategy 3: BCA Debit — process EACH PAGE independently to avoid Y-coordinate bleeding
 	var allTxs []model.ExtractedTransaction
 	globalIdx := 0
-	for _, pageContent := range pages {
+	for i, pageContent := range pages {
+		if i == 0 {
+			os.WriteFile("bca_credit_debug.txt", []byte(pageContent), 0644)
+		}
 		txs := p.extractBCADebitPage(pageContent, globalIdx)
 		allTxs = append(allTxs, txs...)
 		globalIdx += len(txs)
@@ -130,16 +134,26 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.Extr
 		return briTokpedTxs, nil
 	}
 
-	// Strategy 7: Seabank Digital Bank — process EACH PAGE independently
-	var seabankTxs []model.ExtractedTransaction
+	// Strategy 8: Superbank Digital Bank — process EACH PAGE independently
+	var superbankTxs []model.ExtractedTransaction
 	globalIdx = 0
 	for _, pageContent := range pages {
-		txs := p.extractSeabankPage(pageContent, globalIdx)
-		seabankTxs = append(seabankTxs, txs...)
+		txs := p.extractSuperbankPage(pageContent, globalIdx)
+		superbankTxs = append(superbankTxs, txs...)
 		globalIdx += len(txs)
 	}
-	if len(seabankTxs) > 0 {
-		return seabankTxs, nil
+	// Strategy 9: BCA Credit Card (Coordinate based with hex F2 encoding)
+	var transactions []model.ExtractedTransaction
+	idx := 0
+	for _, pge := range pages {
+		txs := p.extractBCACreditPage(pge, idx)
+		if len(txs) > 0 {
+			transactions = append(transactions, txs...)
+			idx += len(txs)
+		}
+	}
+	if len(transactions) > 0 {
+		return transactions, nil
 	}
 
 	return nil, ErrNoTransactions
@@ -148,6 +162,11 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.Extr
 // ParseStatementFromBytes is a convenience wrapper for byte slices.
 func (p *Parser) ParseStatementFromBytes(data []byte, password string) ([]model.ExtractedTransaction, error) {
 	return p.ParseStatement(bytes.NewReader(data), password)
+}
+
+// DumpPages exports raw page content for debugging (temporary).
+func (p *Parser) DumpPages(rs io.ReadSeeker, password string) ([]string, error) {
+	return p.extractPages(rs, password)
 }
 
 // extractPages pulls raw content from each page of the PDF.
@@ -224,7 +243,8 @@ func (p *Parser) extractPages(rs io.ReadSeeker, password string) ([]string, erro
 func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.ExtractedTransaction {
 	// Match: X Y Td followed by (text) Tj
 	// Example: "43.25 575.99 Td\n(26/02)Tj"
-	tdTjRegex := regexp.MustCompile(`([\d.]+)\s+([\d.]+)\s+Td\s*\n(?:/\S+\s+Tw\s*\n)?(?:/\S+\s+\S+\s+\S+\s+\S+\s+Tc\s*\n)?(?:\S+\s+Tc\s*\n)?(?:\S+\s+Tw\s*\n)?\(([^)]*)\)\s*Tj`)
+	// Improved for Xpresi which may have intermediate Tf/Tc/Tw/etc.
+	tdTjRegex := regexp.MustCompile(`([\d.]+)\s+([\d.]+)\s+Td[\s\S]*?\(([^)]*)\)\s*Tj`)
 
 	type token struct {
 		x, y float64
@@ -246,10 +266,10 @@ func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.Extra
 		return nil
 	}
 
-	// BCA short-date regex: exactly DD/MM with no year
-	shortDateRe := regexp.MustCompile(`^\d{2}/\d{2}$`)
+	// BCA short-date regex: DD/MM, optionally prefixed with labels like TGL: or TANGGAL :
+	shortDateRe := regexp.MustCompile(`(?:TGL: |TANGGAL :|TANGGAL )?(\d{2}/\d{2})$`)
 	// Amount regex: numeric with dots/commas
-	amountRe := regexp.MustCompile(`^[\d,]+\.\d{2}$`)
+	amountRe := regexp.MustCompile(`^[\d,.]+$`)
 
 	// Group tokens by Y (rows within ~2pt tolerance)
 	type row struct {
@@ -257,8 +277,9 @@ func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.Extra
 		tokens []token
 	}
 
+	// Group tokens by Y (rows within ~12pt tolerance for multi-line BCA Xpresi)
 	var rows []row
-	const yTol = 2.0
+	const yTol = 12.0
 	for _, t := range tokens {
 		found := false
 		for i := range rows {
@@ -302,8 +323,13 @@ func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.Extra
 
 		for _, t := range row.tokens {
 			switch {
-			case t.x < 70 && shortDateRe.MatchString(t.text):
-				dateToken = t.text
+			case t.x < 120 && shortDateRe.MatchString(t.text):
+				dMatch := shortDateRe.FindStringSubmatch(t.text)
+				if len(dMatch) > 1 {
+					dateToken = dMatch[1]
+				} else {
+					dateToken = t.text
+				}
 			case t.x >= 70 && t.x < 180:
 				typeToken = t.text
 			case t.x >= 180 && t.x < 380:
@@ -392,9 +418,15 @@ func (p *Parser) extractBCADebitPage(content string, startIdx int) []model.Extra
 		var descParts []string
 		for _, d := range b.descParts {
 			d = strings.TrimSpace(d)
-			// Skip reference/technical lines (TGL:, QR, addresses)
-			if d == "" || strings.HasPrefix(d, "TGL:") || strings.HasPrefix(d, "QR ") ||
-				strings.HasPrefix(d, "CUST NO.:") || strings.HasPrefix(d, "00000.00") ||
+			
+			// Trim technical prefixes instead of skipping
+			d = strings.TrimPrefix(d, "00000.00")
+			d = strings.TrimPrefix(d, "QR ")
+			d = strings.TrimSpace(d)
+
+			// Skip reference/technical lines (TGL:, addresses, etc.)
+			if d == "" || strings.HasPrefix(d, "TGL:") || 
+				strings.HasPrefix(d, "CUST NO.:") ||
 				d == "DB" || d == "CR" || len(d) < 2 {
 				continue
 			}
@@ -721,12 +753,18 @@ func parseDate(s string) (time.Time, error) {
 func parseIDRAmount(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 
-	// Detect format: if comma is followed by exactly 2 digits at end → decimal comma
+	// Detect format: if comma is followed by exactly 2 digits at end → decimal comma (Standard Indo)
+	// Example: "55.000,00"
 	if regexp.MustCompile(`,\d{2}$`).MatchString(s) {
-		// Format: "55.000,00" → remove decimal, then remove dots
 		idx := strings.LastIndex(s, ",")
 		s = s[:idx]
 		s = strings.ReplaceAll(s, ".", "")
+	} else if regexp.MustCompile(`\.\d{2}$`).MatchString(s) {
+		// Detect format: if dot is followed by exactly 2 digits at end → decimal dot (Xpresi)
+		// Example: "154,300.00"
+		idx := strings.LastIndex(s, ".")
+		s = s[:idx]
+		s = strings.ReplaceAll(s, ",", "")
 	} else {
 		// Could be comma-thousands (AEON: "160,000") or dot-thousands (BCA: "55.000")
 		s = strings.ReplaceAll(s, ",", "")
@@ -1173,4 +1211,388 @@ func (p *Parser) extractSeabankPage(pageContent string, startIdx int) []model.Ex
 		}
 	}
 	return transactions
+}
+func (p *Parser) extractSuperbankPage(content string, startIdx int) []model.ExtractedTransaction {
+	// Superbank uses hex-encoded text blocks with a +29 shift
+	// Pattern: 1 0 0 -1 X Y Tm ... <hex> Tj
+	tmHexTjRegex := regexp.MustCompile(`1 0 0 -1 ([\d.]+) ([\d.]+) Tm[\s\S]*?<([0-9A-Fa-f]+)> Tj`)
+
+	type token struct {
+		x, y float64
+		text string
+	}
+	var tokens []token
+	
+	matches := tmHexTjRegex.FindAllStringSubmatch(content, -1)
+	yearRegex := regexp.MustCompile(`20\d{2}`)
+	year := time.Now().Year()
+
+	for _, m := range matches {
+		x, _ := strconv.ParseFloat(m[1], 64)
+		y, _ := strconv.ParseFloat(m[2], 64)
+		hexStr := m[3]
+		
+		bytes, _ := hex.DecodeString(hexStr)
+		var sb strings.Builder
+		for i := 0; i < len(bytes); i += 2 {
+			if i+1 >= len(bytes) { break }
+			val := uint16(bytes[i])<<8 | uint16(bytes[i+1])
+			char := rune(int(val) + 29)
+			sb.WriteRune(char)
+		}
+		text := strings.TrimSpace(sb.String())
+		if text != "" {
+			tokens = append(tokens, token{x: x, y: y, text: text})
+			if yMatch := yearRegex.FindString(text); yMatch != "" {
+				if statementYear, err := strconv.Atoi(yMatch); err == nil {
+					year = statementYear
+				}
+			}
+		}
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Group tokens by Y-coordinate
+	type row struct {
+		y      float64
+		tokens []token
+	}
+	var rows []row
+	for _, t := range tokens {
+		found := false
+		for i := range rows {
+			if math.Abs(rows[i].y-t.y) <= 12.0 {
+				rows[i].tokens = append(rows[i].tokens, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append(rows, row{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows top-to-bottom (Y ascending since it is inverted top-down)
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].y < rows[j].y
+	})
+
+	var transactions []model.ExtractedTransaction
+	idx := startIdx
+
+	// Columns (approx): Tanggal=74, Deskripsi=156, Uang Keluar=439, Uang Masuk=557, Saldo=718
+	for _, r := range rows {
+		sort.Slice(r.tokens, func(i, j int) bool {
+			return r.tokens[i].x < r.tokens[j].x
+		})
+
+		var dateStr, desc, outgoing, incoming string
+		for _, t := range r.tokens {
+			switch {
+			case t.x < 120:
+				if dateStr != "" { dateStr += " " }
+				dateStr += t.text
+			case t.x >= 120 && t.x < 420:
+				if desc != "" { desc += " " }
+				desc += t.text
+			case t.x >= 420 && t.x < 520:
+				outgoing = t.text
+			case t.x >= 520 && t.x < 650:
+				incoming = t.text
+			}
+		}
+
+		// Update year if found in date string (e.g., "1 Mar 2026")
+		if yearMatch := regexp.MustCompile(`\d{4}`).FindString(dateStr); yearMatch != "" {
+			y, _ := strconv.Atoi(yearMatch)
+			year = y
+		}
+
+		// Process transaction row
+		if (outgoing != "" || incoming != "") && (strings.Contains(outgoing, "Rp") || strings.Contains(incoming, "Rp")) {
+			// Parse date: e.g. "1 Mar"
+			// Split by space and take first two tokens if it is not a full-year date
+			dateParts := strings.Fields(dateStr)
+			if len(dateParts) < 2 {
+				continue
+			}
+			day, _ := strconv.Atoi(dateParts[0])
+			monthStr := dateParts[1]
+			month, ok := monthMap[monthStr]
+			if !ok {
+				// Try standard English fallback
+				t, err := time.Parse("Jan", monthStr)
+				if err == nil {
+					month = t.Month()
+				} else {
+					continue
+				}
+			}
+
+			date := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+			
+			// We only care about spending (Uang Keluar)
+			if outgoing != "" && !strings.Contains(incoming, "Rp") {
+				amountStr := strings.TrimPrefix(outgoing, "-")
+				amountStr = strings.TrimPrefix(amountStr, "Rp")
+				amount, err := parseIDRAmount(amountStr)
+				if err == nil && amount > 0 {
+					transactions = append(transactions, model.ExtractedTransaction{
+						TempID:          fmt.Sprintf("pdf-%d", idx),
+						AmountIDR:       amount,
+						TransactionDate: date,
+						Description:     cleanDescription(desc),
+						Category:        guessCategory(desc),
+					})
+					idx++
+				}
+			}
+		}
+	}
+
+	return transactions
+}
+
+// extractBCACreditPage parses BCA Credit Card statements using Td coordinate grouping and hex F2 decoding.
+func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.ExtractedTransaction {
+	var transactions []model.ExtractedTransaction
+
+	type token struct {
+		x, y float64
+		text string
+	}
+	var tokens []token
+
+	// Regex for operators
+	btRegex := regexp.MustCompile(`(?i)\bBT\b`)
+	tmRegex := regexp.MustCompile(`(?i)([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+Tm`)
+	tdRegex := regexp.MustCompile(`(?i)([\d.-]+)\s+([\d.-]+)\s+Td`)
+	tjRegex := regexp.MustCompile(`(?i)<([0-9A-Fa-f]+)>[\s]*Tj`)
+
+	var curX, curY float64
+	var lineX, lineY float64 // Start of current line
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if btRegex.MatchString(line) {
+			curX, curY = 0, 0
+			lineX, lineY = 0, 0
+		}
+
+		if m := tmRegex.FindStringSubmatch(line); len(m) > 0 {
+			// Tm sets the text matrix. The 5th and 6th elements are the translation (X, Y).
+			curX, _ = strconv.ParseFloat(m[5], 64)
+			curY, _ = strconv.ParseFloat(m[6], 64)
+			lineX, lineY = curX, curY
+		}
+
+		if m := tdRegex.FindStringSubmatch(line); len(m) > 0 {
+			dx, _ := strconv.ParseFloat(m[1], 64)
+			dy, _ := strconv.ParseFloat(m[2], 64)
+			// Td moves the line start and sets the current position to that start
+			lineX += dx
+			lineY += dy
+			curX, curY = lineX, lineY
+		}
+
+		if m := tjRegex.FindStringSubmatch(line); len(m) > 0 {
+			hexStr := m[1]
+			text := decodeBCAF2(hexStr)
+			if text != "" {
+				tokens = append(tokens, token{x: curX, y: curY, text: text})
+			}
+		}
+	}
+
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	// Group tokens by Y-coordinate
+	type row struct {
+		y      float64
+		tokens []token
+	}
+	var rows []row
+	for _, t := range tokens {
+		found := false
+		for i := range rows {
+			if math.Abs(rows[i].y-t.y) <= 2.0 {
+				rows[i].tokens = append(rows[i].tokens, t)
+				found = true
+				break
+			}
+		}
+		if !found {
+			rows = append(rows, row{y: t.y, tokens: []token{t}})
+		}
+	}
+
+	// Sort rows by Y descending
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].y > rows[j].y
+	})
+
+	idx := startIdx
+	year := time.Now().Year()
+
+	for _, r := range rows {
+		// Sort tokens in row by X-coordinate
+		sort.Slice(r.tokens, func(i, j int) bool {
+			return r.tokens[i].x < r.tokens[j].x
+		})
+
+		var txDate, desc, outgoing, dbCr string
+		for _, t := range r.tokens {
+			// BCA Credit Columns (X coordinates)
+			// Date: ~75
+			// Desc: ~196
+			// Amount: ~479
+			// Type: ~526 (CR/DB)
+			if t.x < 150 {
+				txDate += t.text
+			} else if t.x >= 150 && t.x < 450 {
+				desc += t.text
+			} else if t.x >= 450 && t.x < 515 {
+				outgoing += t.text
+			} else {
+				dbCr += t.text
+			}
+		}
+
+		txDate = strings.ReplaceAll(txDate, " ", "")
+		// Handle obfuscated date format DD/MM
+		if matched, _ := regexp.MatchString(`^\d{2}/\d{2}$`, txDate); matched {
+			parts := strings.Split(txDate, "/")
+			day, _ := strconv.Atoi(parts[0])
+			month, _ := strconv.Atoi(parts[1])
+			
+			date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+			
+			amountStr := strings.ReplaceAll(outgoing, ".", "")
+			amountStr = strings.ReplaceAll(amountStr, ",", ".")
+			amount, err := strconv.ParseFloat(amountStr, 64)
+
+			if err == nil && amount > 0 {
+				if strings.Contains(dbCr, "CR") {
+					amount = -amount // Credit card payment or reversal
+				}
+				
+				cleanDesc := cleanDescription(desc)
+				transactions = append(transactions, model.ExtractedTransaction{
+					TempID:          fmt.Sprintf("pdf-%d", idx),
+					AmountIDR:       int64(amount),
+					TransactionDate: date,
+					Description:     cleanDesc,
+					Category:        guessCategory(cleanDesc),
+				})
+				idx++
+			}
+		}
+	}
+
+	return transactions
+}
+
+// decodeBCAF2 translates BCA hex strings using the observed ToUnicode CMap.
+func decodeBCAF2(hexStr string) string {
+	var sb strings.Builder
+	for i := 0; i < len(hexStr); i += 4 {
+		if i+4 > len(hexStr) {
+			break
+		}
+		var val int
+		fmt.Sscanf(hexStr[i:i+4], "%x", &val)
+		
+		// Map based on extracted ToUnicode CMap
+		switch val {
+		// Numbers
+		case 0x85: sb.WriteRune('0')
+		case 0x86: sb.WriteRune('1')
+		case 0x87: sb.WriteRune('2')
+		case 0x88: sb.WriteRune('3')
+		case 0x89: sb.WriteRune('4')
+		case 0x8a: sb.WriteRune('5')
+		case 0x8b: sb.WriteRune('6')
+		case 0x8c: sb.WriteRune('7')
+		case 0x8d: sb.WriteRune('8')
+		case 0x8e: sb.WriteRune('9')
+		
+		// Uppercase
+		case 0x01: sb.WriteRune('A')
+		case 0x09: sb.WriteRune('B')
+		case 0x0a: sb.WriteRune('C')
+		case 0x0c: sb.WriteRune('D')
+		case 0x0e: sb.WriteRune('E')
+		case 0x13: sb.WriteRune('F')
+		case 0x14: sb.WriteRune('G')
+		case 0x15: sb.WriteRune('H')
+		case 0x16: sb.WriteRune('I')
+		case 0x1b: sb.WriteRune('J')
+		case 0x1c: sb.WriteRune('K')
+		case 0x1d: sb.WriteRune('L')
+		case 0x1f: sb.WriteRune('M')
+		case 0x20: sb.WriteRune('N')
+		case 0x22: sb.WriteRune('O')
+		case 0x2a: sb.WriteRune('P')
+		case 0x2d: sb.WriteRune('R')
+		case 0x2e: sb.WriteRune('S')
+		case 0x30: sb.WriteRune('T')
+		case 0x31: sb.WriteRune('U')
+		case 0x36: sb.WriteRune('V')
+		case 0x37: sb.WriteRune('W')
+		case 0x38: sb.WriteRune('X')
+		case 0x39: sb.WriteRune('Y')
+		
+		// Lowercase
+		case 0x3e: sb.WriteRune('a')
+		case 0x46: sb.WriteRune('b')
+		case 0x47: sb.WriteRune('c')
+		case 0x49: sb.WriteRune('d')
+		case 0x4b: sb.WriteRune('e')
+		case 0x50: sb.WriteRune('f')
+		case 0x51: sb.WriteRune('g')
+		case 0x52: sb.WriteRune('h')
+		case 0x53: sb.WriteRune('i')
+		case 0x59: sb.WriteRune('j')
+		case 0x5b: sb.WriteRune('k')
+		case 0x5c: sb.WriteRune('l')
+		case 0x5e: sb.WriteRune('m')
+		case 0x5f: sb.WriteRune('n')
+		case 0x61: sb.WriteRune('o')
+		case 0x69: sb.WriteRune('p')
+		case 0x6c: sb.WriteRune('r')
+		case 0x6d: sb.WriteRune('s')
+		case 0x70: sb.WriteRune('t')
+		case 0x71: sb.WriteRune('u')
+		case 0x77: sb.WriteRune('w')
+		case 0x79: sb.WriteRune('y')
+		
+		// Symbols
+		case 0xc9: sb.WriteRune('.')
+		case 0xca: sb.WriteRune(',')
+		case 0xcb: sb.WriteRune(':')
+		case 0xd6: sb.WriteRune('/')
+		case 0xde: sb.WriteRune('*') // Placeholder for 0xde if it appears
+		case 0xe8: sb.WriteRune('-')
+		case 0xff: sb.WriteRune('\'')
+		case 0x0104: sb.WriteRune(' ')
+		case 0x0126: sb.WriteRune('%')
+		case 0x0130: sb.WriteRune('@')
+		case 0x0131: sb.WriteRune('&')
+		
+		default:
+			// Fallback: If not in map, just output a placeholder to avoid breaking the string length
+			sb.WriteRune('?')
+		}
+	}
+	return sb.String()
 }
