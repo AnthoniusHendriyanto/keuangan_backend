@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"keuangan_backend/internal/router"
+	"keuangan_backend/internal/security"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/cors"
@@ -62,7 +63,8 @@ func main() {
 
 	// 4. Initialize Fiber
 	app := fiber.New(fiber.Config{
-		AppName: "True Liability Tracker API v1",
+		AppName:   "True Liability Tracker API v1",
+		BodyLimit: 10 * 1024 * 1024, // 10MB limit
 	})
 
 	// Middleware
@@ -73,8 +75,19 @@ func main() {
 	}))
 	app.Use(logger.New())
 
+	// 5. Antivirus Scanner
+	var avScanner security.AvScanner
+	clamavURL := os.Getenv("CLAMAV_URL")
+	if clamavURL != "" {
+		avScanner = security.NewClamAVScanner(clamavURL)
+		slog.Info("ClamAV scanner initialized", "url", clamavURL)
+	} else {
+		avScanner = &security.NoopScanner{}
+		slog.Info("ClamAV scanner disabled (no CLAMAV_URL set)")
+	}
+
 	// Routes
-	router.SetupRoutes(app, pool)
+	router.SetupRoutes(app, pool, avScanner)
 
 	// Graceful Shutdown
 	c := make(chan os.Signal, 1)

@@ -3,24 +3,27 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"time"
 
 	"keuangan_backend/internal/model"
 	"keuangan_backend/internal/pdf"
 	"keuangan_backend/internal/repository"
+	"keuangan_backend/internal/security"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 )
 
 type TransactionHandler struct {
-	repo   *repository.TransactionRepository
-	parser *pdf.Parser
+	repo    *repository.TransactionRepository
+	parser  *pdf.Parser
+	scanner security.AvScanner
 }
 
-func NewTransactionHandler(repo *repository.TransactionRepository, parser *pdf.Parser) *TransactionHandler {
-	return &TransactionHandler{repo: repo, parser: parser}
+func NewTransactionHandler(repo *repository.TransactionRepository, parser *pdf.Parser, scanner security.AvScanner) *TransactionHandler {
+	return &TransactionHandler{repo: repo, parser: parser, scanner: scanner}
 }
 
 // ListTransactions handles GET /v1/transactions
@@ -96,7 +99,19 @@ func (h *TransactionHandler) UploadStatement(c fiber.Ctx) error {
 	// Get the optional password from form data
 	password := c.FormValue("password")
 
-	// 1. Parse PDF
+	// 1. Antivirus Scan
+	if err := h.scanner.Scan(c.Context(), file); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("Security check failed: %v", err),
+		})
+	}
+
+	// Reset file pointer after scan
+	if seeker, ok := file.(io.Seeker); ok {
+		seeker.Seek(0, io.SeekStart)
+	}
+
+	// 2. Parse PDF
 	extracted, err := h.parser.ParseStatement(file, password) // Modified to pass password
 	if err != nil {
 		if errors.Is(err, pdf.ErrPasswordRequired) {
@@ -105,7 +120,7 @@ func (h *TransactionHandler) UploadStatement(c fiber.Ctx) error {
 			})
 		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("Failed to parse statement: %v", err),
+			"error": err.Error(),
 		})
 	}
 

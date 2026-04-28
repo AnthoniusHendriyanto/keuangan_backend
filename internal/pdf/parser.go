@@ -22,10 +22,10 @@ import (
 
 // Common errors returned by the parser.
 var (
-	ErrEmptyPDF         = errors.New("pdf: extracted text is empty, the file may be image-based or encrypted")
-	ErrInvalidFile      = errors.New("pdf: failed to read or parse the file, ensure it is a valid PDF")
-	ErrNoTransactions   = errors.New("pdf: no transaction rows could be extracted from the statement")
-	ErrPasswordRequired = errors.New("pdf: file is encrypted and requires a password to open")
+	ErrEmptyPDF         = errors.New("the PDF content is unreadable (it might be a scan or photo instead of a digital statement)")
+	ErrInvalidFile      = errors.New("the file is not a valid PDF or is corrupted")
+	ErrNoTransactions   = errors.New("this bank or statement format is not supported yet")
+	ErrPasswordRequired = errors.New("this PDF is password-protected; please provide the password to continue")
 )
 
 // Regex patterns for different statement formats
@@ -142,14 +142,15 @@ func (p *Parser) ParseStatement(rs io.ReadSeeker, password string) ([]model.Extr
 		superbankTxs = append(superbankTxs, txs...)
 		globalIdx += len(txs)
 	}
+	if len(superbankTxs) > 0 {
+		return superbankTxs, nil
+	}
 	// Strategy 9: BCA Credit Card (Coordinate based with hex F2 encoding)
 	var transactions []model.ExtractedTransaction
-	idx := 0
-	for _, pge := range pages {
-		txs := p.extractBCACreditPage(pge, idx)
+	for i, pge := range pages {
+		txs := p.extractBCACreditPage(pge, i)
 		if len(txs) > 0 {
 			transactions = append(transactions, txs...)
-			idx += len(txs)
 		}
 	}
 	if len(transactions) > 0 {
@@ -164,10 +165,6 @@ func (p *Parser) ParseStatementFromBytes(data []byte, password string) ([]model.
 	return p.ParseStatement(bytes.NewReader(data), password)
 }
 
-// DumpPages exports raw page content for debugging (temporary).
-func (p *Parser) DumpPages(rs io.ReadSeeker, password string) ([]string, error) {
-	return p.extractPages(rs, password)
-}
 
 // extractPages pulls raw content from each page of the PDF.
 func (p *Parser) extractPages(rs io.ReadSeeker, password string) ([]string, error) {
@@ -234,6 +231,7 @@ func (p *Parser) extractPages(rs io.ReadSeeker, password string) ([]string, erro
 		return nil, ErrEmptyPDF
 	}
 
+	fmt.Printf("DEBUG: extractPages - successfully extracted %d pages\n", len(pages))
 	return pages, nil
 }
 
@@ -1366,46 +1364,34 @@ func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.Extr
 	}
 	var tokens []token
 
-	// Regex for operators
-	btRegex := regexp.MustCompile(`(?i)\bBT\b`)
-	tmRegex := regexp.MustCompile(`(?i)([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+Tm`)
-	tdRegex := regexp.MustCompile(`(?i)([\d.-]+)\s+([\d.-]+)\s+Td`)
-	tjRegex := regexp.MustCompile(`(?i)<([0-9A-Fa-f]+)>[\s]*Tj`)
-
+	opRegex := regexp.MustCompile(`(?i)(?:BT|ET|([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+Tm|([\d.-]+)\s+([\d.-]+)\s+Td|<([0-9A-Fa-f]+)>Tj|\(([^)]*)\)Tj)`)
 	var curX, curY float64
-	var lineX, lineY float64 // Start of current line
+	var lineX, lineY float64
 
-	lines := strings.Split(content, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		if btRegex.MatchString(line) {
+	matches := opRegex.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
+		rawOp := m[0]
+		switch {
+		case strings.EqualFold(rawOp, "BT"):
 			curX, curY = 0, 0
 			lineX, lineY = 0, 0
-		}
-
-		if m := tmRegex.FindStringSubmatch(line); len(m) > 0 {
-			// Tm sets the text matrix. The 5th and 6th elements are the translation (X, Y).
+		case strings.HasSuffix(strings.ToUpper(rawOp), "TM"):
 			curX, _ = strconv.ParseFloat(m[5], 64)
 			curY, _ = strconv.ParseFloat(m[6], 64)
 			lineX, lineY = curX, curY
-		}
-
-		if m := tdRegex.FindStringSubmatch(line); len(m) > 0 {
-			dx, _ := strconv.ParseFloat(m[1], 64)
-			dy, _ := strconv.ParseFloat(m[2], 64)
-			// Td moves the line start and sets the current position to that start
+		case strings.HasSuffix(strings.ToUpper(rawOp), "TD"):
+			dx, _ := strconv.ParseFloat(m[7], 64)
+			dy, _ := strconv.ParseFloat(m[8], 64)
 			lineX += dx
 			lineY += dy
 			curX, curY = lineX, lineY
-		}
-
-		if m := tjRegex.FindStringSubmatch(line); len(m) > 0 {
-			hexStr := m[1]
-			text := decodeBCAF2(hexStr)
+		case strings.HasSuffix(strings.ToUpper(rawOp), "TJ"):
+			var text string
+			if m[9] != "" {
+				text = decodeBCAF2(m[9])
+			} else {
+				text = m[10]
+			}
 			if text != "" {
 				tokens = append(tokens, token{x: curX, y: curY, text: text})
 			}
@@ -1416,7 +1402,18 @@ func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.Extr
 		return nil
 	}
 
-	// Group tokens by Y-coordinate
+	year := time.Now().Year() // Fallback
+	for _, t := range tokens {
+		if strings.Contains(t.text, "202") {
+			reYear := regexp.MustCompile(`20\d{2}`)
+			if match := reYear.FindString(t.text); match != "" {
+				y, _ := strconv.Atoi(match)
+				year = y
+				break
+			}
+		}
+	}
+
 	type row struct {
 		y      float64
 		tokens []token
@@ -1425,7 +1422,7 @@ func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.Extr
 	for _, t := range tokens {
 		found := false
 		for i := range rows {
-			if math.Abs(rows[i].y-t.y) <= 2.0 {
+			if math.Abs(rows[i].y-t.y) <= 3.0 {
 				rows[i].tokens = append(rows[i].tokens, t)
 				found = true
 				break
@@ -1436,56 +1433,35 @@ func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.Extr
 		}
 	}
 
-	// Sort rows by Y descending
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].y > rows[j].y
-	})
+	sort.Slice(rows, func(i, j int) bool { return rows[i].y > rows[j].y })
 
 	idx := startIdx
-	year := time.Now().Year()
+	months := map[string]time.Month{
+		"JAN": time.January, "FEB": time.February, "MAR": time.March, "APR": time.April,
+		"MEI": time.May, "JUN": time.June, "JUL": time.July, "AGU": time.August,
+		"SEP": time.September, "OKT": time.October, "NOV": time.November, "DES": time.December,
+	}
 
 	for _, r := range rows {
-		// Sort tokens in row by X-coordinate
-		sort.Slice(r.tokens, func(i, j int) bool {
-			return r.tokens[i].x < r.tokens[j].x
-		})
-
-		var txDate, desc, outgoing, dbCr string
+		sort.Slice(r.tokens, func(i, j int) bool { return r.tokens[i].x < r.tokens[j].x })
+		var txDate, postingDate, desc, outgoing, dbCr string
 		for _, t := range r.tokens {
-			// BCA Credit Columns (X coordinates)
-			// Date: ~75
-			// Desc: ~196
-			// Amount: ~479
-			// Type: ~526 (CR/DB)
-			if t.x < 150 {
-				txDate += t.text
-			} else if t.x >= 150 && t.x < 450 {
-				desc += t.text
-			} else if t.x >= 450 && t.x < 515 {
-				outgoing += t.text
-			} else {
-				dbCr += t.text
-			}
+			if t.x < 100 { txDate += t.text } else if t.x >= 100 && t.x < 185 { postingDate += t.text } else if t.x >= 185 && t.x < 450 { desc += t.text } else if t.x >= 450 && t.x < 515 { outgoing += t.text } else { dbCr += t.text }
 		}
 
-		txDate = strings.ReplaceAll(txDate, " ", "")
-		// Handle obfuscated date format DD/MM
-		if matched, _ := regexp.MatchString(`^\d{2}/\d{2}$`, txDate); matched {
-			parts := strings.Split(txDate, "/")
-			day, _ := strconv.Atoi(parts[0])
-			month, _ := strconv.Atoi(parts[1])
+		txDate = strings.ToUpper(strings.TrimSpace(txDate))
+		re := regexp.MustCompile(`^(\d{2})-(JAN|FEB|MAR|APR|MEI|JUN|JUL|AGU|SEP|OKT|NOV|DES)$`)
+		matches := re.FindStringSubmatch(txDate)
+		if len(matches) == 3 {
+			day, _ := strconv.Atoi(matches[1])
+			monthStr := matches[2]
+			month := months[monthStr]
+			date := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 			
-			date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-			
-			amountStr := strings.ReplaceAll(outgoing, ".", "")
-			amountStr = strings.ReplaceAll(amountStr, ",", ".")
+			amountStr := strings.ReplaceAll(strings.ReplaceAll(outgoing, ".", ""), ",", ".")
 			amount, err := strconv.ParseFloat(amountStr, 64)
-
 			if err == nil && amount > 0 {
-				if strings.Contains(dbCr, "CR") {
-					amount = -amount // Credit card payment or reversal
-				}
-				
+				if strings.Contains(dbCr, "CR") { amount = -amount }
 				cleanDesc := cleanDescription(desc)
 				transactions = append(transactions, model.ExtractedTransaction{
 					TempID:          fmt.Sprintf("pdf-%d", idx),
@@ -1498,9 +1474,10 @@ func (p *Parser) extractBCACreditPage(content string, startIdx int) []model.Extr
 			}
 		}
 	}
-
 	return transactions
 }
+
+
 
 // decodeBCAF2 translates BCA hex strings using the observed ToUnicode CMap.
 func decodeBCAF2(hexStr string) string {

@@ -5,13 +5,14 @@ import (
 	"keuangan_backend/internal/middleware"
 	"keuangan_backend/internal/pdf"
 	"keuangan_backend/internal/repository"
+	"keuangan_backend/internal/security"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // SetupRoutes configures the Fiber application routes based on architecture.md.
-func SetupRoutes(app *fiber.App, pool *pgxpool.Pool) {
+func SetupRoutes(app *fiber.App, pool *pgxpool.Pool, scanner security.AvScanner) {
 	// Repositories
 	ccRepo := repository.NewCreditCardRepository(pool)
 	txRepo := repository.NewTransactionRepository(pool)
@@ -21,7 +22,7 @@ func SetupRoutes(app *fiber.App, pool *pgxpool.Pool) {
 
 	// Handlers
 	ccHandler := handler.NewCreditCardHandler(ccRepo)
-	txHandler := handler.NewTransactionHandler(txRepo, pdfParser)
+	txHandler := handler.NewTransactionHandler(txRepo, pdfParser, scanner)
 	authHandler := handler.NewAuthHandler()
 
 	v1 := app.Group("/v1")

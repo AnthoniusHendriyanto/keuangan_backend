@@ -10,7 +10,7 @@ These banks have been tested and confirmed to work with the `/v1/statements/uplo
 
 | # | Bank / Product | Account Type | Encryption | Notes |
 |---|---|---|---|---|
-| 1 | **BCA** | Credit Card / Debit (Standard & Xpresi) | None | Standard `Td`/`Tj` layout; handles `TGL:` labels |
+| 1 | **BCA** | Credit Card / Debit (Standard & Xpresi) | None | Handles `TGL:` labels and CID-based hex `F2` encoding |
 | 2 | **BRImo** | Savings / Debit e-Statement | None | Standard `Td`/`Tj` layout |
 | 3 | **BRI Ovo U Card** | Credit Card | AES-128 (password required) | Uses `BT X Y Td` column layout; CR payments filtered out |
 | 4 | **BRI Tokopedia Card** | Credit Card | AES-128 (password required) | Same layout as BRI Ovo U Card — shared BRI issuing system |
@@ -37,5 +37,5 @@ These banks have been tested and confirmed to work with the `/v1/statements/uplo
 
 - **Why do some PDFs need passwords?** Banks encrypt PDF statements to prevent unauthorised access. BRI and DBS use AES-128 encryption. You must pass your PDF password as the `password` field in the upload form.
 - **Advanced De-obfuscation (Seabank/Superbank):** These banks use non-standard font encodings (Caesar shifts) and octal escape sequences to obfuscate transaction data. Our parser uses custom decoders (+28 for Seabank, +29 for Superbank) to reconstruct the readable text from the raw PDF content streams.
-- **BCA Xpresi Labels:** The Xpresi format uses non-standard labels like `TGL:` and `TANGGAL :` for transaction dates. Our parser has been enhanced to automatically trim these labels and handle dot-decimal amount formats.
+- **BCA Xpresi & Credit:** The Xpresi format uses non-standard labels like `TGL:`. The **Credit Card** format uses CID-based hex encoding (Font F2) for characters, which our parser decodes using a custom ToUnicode mapping. It also handles the Indonesian `DD-MMM` date format (e.g., `13-MAR`).
 - **The `pdfcpu` patch:** Our backend uses a patched local fork of the `pdfcpu` library (under `patches/pdfcpu/`) to handle AES-128 encrypted statements where the encryption dictionary uses bit-length (`128`) instead of the standard byte-length format. This patch lives in `patches/pdfcpu/pkg/pdfcpu/crypto.go` and `read.go`.
