@@ -49,4 +49,5 @@ func SetupRoutes(app *fiber.App, pool *pgxpool.Pool, scanner security.AvScanner)
 	transactions.Post("/", txHandler.CreateTransaction)
 	transactions.Post("/upload-statement", txHandler.UploadStatement)
 	transactions.Post("/merge", txHandler.MergeTransaction)
+	transactions.Post("/reconcile-batch", txHandler.ReconcileBatch)
 }

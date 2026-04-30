@@ -65,6 +65,15 @@ func getES256PublicKey() *ecdsa.PublicKey {
 
 // AuthMiddleware validates the Supabase JWT token.
 func AuthMiddleware(c fiber.Ctx) error {
+	// Bypass auth if SKIP_AUTH=true (Dev only)
+	if os.Getenv("SKIP_AUTH") == "true" {
+		slog.Warn("AUTHENTICATION BYPASS ENABLED (SKIP_AUTH=true)")
+		// Use a fixed valid ID for testing (found in auth.users)
+		mockUserID := uuid.MustParse("1b538709-1cd8-4115-afe3-002182eb9e59")
+		c.Locals("userID", mockUserID)
+		return c.Next()
+	}
+
 	authHeader := c.Get("Authorization")
 	if authHeader == "" {
 		slog.Warn("Missing authorization header")

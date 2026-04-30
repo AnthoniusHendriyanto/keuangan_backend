@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"time"
 
@@ -158,7 +159,50 @@ func (h *TransactionHandler) UploadStatement(c fiber.Ctx) error {
 	})
 }
 
-// MergeTransaction handles POST /v1/transactions/merge
+// ReconcileBatch handles POST /v1/transactions/reconcile-batch
+func (h *TransactionHandler) ReconcileBatch(c fiber.Ctx) error {
+	userID := c.Locals("userID").(uuid.UUID)
+
+	var req struct {
+		Items []struct {
+			ExistingID *uuid.UUID               `json:"existing_id"` // If null, create as new
+			Data       model.ExtractedTransaction `json:"data"`
+		} `json:"items"`
+	}
+
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	for _, item := range req.Items {
+		if item.ExistingID != nil {
+			// Merge/Reconcile with existing
+			err := h.repo.UpdateToReconciled(c.Context(), *item.ExistingID, item.Data.AmountIDR, item.Data.TransactionDate, item.Data.Description)
+			if err != nil {
+				slog.Error("Failed to reconcile transaction", "id", item.ExistingID, "error", err)
+			}
+		} else {
+			// Create new transaction
+			tx := model.Transaction{
+				AmountIDR:       item.Data.AmountIDR,
+				TransactionDate: item.Data.TransactionDate,
+				Description:     item.Data.Description,
+				Category:        item.Data.Category,
+				Type:            model.TypePDFParsed,
+				Status:          model.StatusReconciled,
+				PaymentMethod:   model.PaymentMethodCC, // Default for PDF upload
+			}
+			_, err := h.repo.Create(c.Context(), userID, tx)
+			if err != nil {
+				slog.Error("Failed to create new transaction from PDF", "error", err)
+			}
+		}
+	}
+
+	return c.JSON(fiber.Map{"status": "batch_completed"})
+}
+
+// MergeTransaction handles POST /v1/transactions/merge (deprecated/legacy)
 func (h *TransactionHandler) MergeTransaction(c fiber.Ctx) error {
 	var req model.MergeTransactionRequest
 	if err := c.Bind().JSON(&req); err != nil {
